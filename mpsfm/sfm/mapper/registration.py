@@ -23,6 +23,9 @@ class MpsfmRegistration(BaseClass):
         "resample_bunlde": False,  # exploration,
         "colmap_options": "<--->",
         "verbose": 0,
+        # 先验外参配置
+        "use_prior_poses": False,  # 是否使用先验外参
+        "pose_config_path": None,  # 外参配置文件路径
     }
 
     def _init(self, mpsfm_rec, correspondences, triangulator, **kwargs):
@@ -34,6 +37,63 @@ class MpsfmRegistration(BaseClass):
 
         self.half_ap_min_inliers = 0
         self.registration_cache = defaultdict(dict)
+        
+        # 初始化先验外参
+        self.prior_poses = {}
+        if self.conf.use_prior_poses and self.conf.pose_config_path:
+            self._load_prior_poses()
+    
+    def _load_prior_poses(self):
+        """加载先验相机外参."""
+        try:
+            import yaml
+            from pathlib import Path
+            
+            pose_config_path = Path(self.conf.pose_config_path)
+            if not pose_config_path.exists():
+                print(f"Warning: Pose config file not found: {pose_config_path}")
+                return
+            
+            with open(pose_config_path, 'r') as f:
+                config = yaml.safe_load(f)
+            
+            camera_poses = config.get('camera_poses', {})
+            
+            # 解析外参矩阵
+            for image_name, pose_data in camera_poses.items():
+                transform_matrix = np.array(pose_data['transform_matrix'])
+                
+                # 转换为pycolmap格式
+                # 提取左上角3x3子矩阵（旋转矩阵）
+                rotation_matrix = transform_matrix[:3, :3]
+                # 提取第4列的前3个元素（平移向量）
+                translation = transform_matrix[:3, 3]
+                
+                # 确保旋转矩阵是正交的
+                U, _, Vt = np.linalg.svd(rotation_matrix)
+                rotation_matrix = U @ Vt
+                
+                # 创建pycolmap Rigid3d对象
+                # 直接从旋转矩阵创建Rotation3d
+                rotation = pycolmap.Rotation3d(rotation_matrix)
+                rigid_pose = pycolmap.Rigid3d(rotation, translation)
+                
+                self.prior_poses[image_name] = rigid_pose
+            
+            print(f"Loaded {len(self.prior_poses)} prior poses from {pose_config_path}")
+                
+        except Exception as e:
+            print(f"Warning: Failed to load prior poses: {e}")
+    
+    def has_prior_pose(self, image_name: str) -> bool:
+        """检查图像是否有先验外参."""
+        return image_name in self.prior_poses
+    
+    def get_prior_pose(self, image_name: str):
+        """获取先验外参."""
+        if self.has_prior_pose(image_name):
+            return self.prior_poses[image_name]
+        return None
 
     @staticmethod
     def _candidate_points3D_for_init(
@@ -105,8 +165,24 @@ class MpsfmRegistration(BaseClass):
             "camera2": self.mpsfm_rec.camera(imid2),
         }
         candidate_points, cam_from_world2 = self._init_pair_points_and_pose(**kwargs)
-        self.mpsfm_rec.images[imid1].cam_from_world = pycolmap.Rigid3d()
-        self.mpsfm_rec.images[imid2].cam_from_world = cam_from_world2
+        
+        # 检查是否有先验外参
+        image1_name = self.mpsfm_rec.images[imid1].name
+        image2_name = self.mpsfm_rec.images[imid2].name
+        
+        # 设置初始外参
+        if self.has_prior_pose(image1_name):
+            prior_pose1 = self.get_prior_pose(image1_name)
+            self.mpsfm_rec.images[imid1].cam_from_world = prior_pose1
+        else:
+            self.mpsfm_rec.images[imid1].cam_from_world = pycolmap.Rigid3d()
+        
+        if self.has_prior_pose(image2_name):
+            prior_pose2 = self.get_prior_pose(image2_name)
+            self.mpsfm_rec.images[imid2].cam_from_world = prior_pose2
+        else:
+            self.mpsfm_rec.images[imid2].cam_from_world = cam_from_world2
+        
         self.mpsfm_rec.register_image(imid1)
         self.mpsfm_rec.register_image(imid2)
         if len(candidate_points["xyz"]) < 3:
@@ -133,6 +209,15 @@ class MpsfmRegistration(BaseClass):
         """Register next image and triangulate points."""
         image = self.mpsfm_rec.images[imid]
         camera = self.mpsfm_rec.rec.cameras[image.camera_id]
+
+        # 检查是否有先验外参
+        image_name = image.name
+        if self.has_prior_pose(image_name):
+            prior_pose = self.get_prior_pose(image_name)
+            if prior_pose is not None:
+                image.cam_from_world = prior_pose
+                self.mpsfm_rec.register_image(imid)
+                return True
 
         if ref_imids is None:
             ref_imids = self.mpsfm_rec.registered_images.keys()
@@ -168,72 +253,24 @@ class MpsfmRegistration(BaseClass):
 
             AP_info = self.absolute_pose_estimator(points2D, points3D, camera)
             if AP_info is None:
-                print("\nAP estim No inliers found")
-                return False
+                if force_registration:
+                    print(f"\nForce registering image {imid}")
+                    break
+                else:
+                    print(f"\nFailed to register image {imid}")
+                    return False
 
-            if AP_info["num_inliers"] < ap_min_num_inliers and not force_registration:
-                print(f"\nAP estim Not enough inliers: {ap_min_num_inliers}")
-                return False
+            if AP_info["num_inliers"] < ap_min_num_inliers:
+                if force_registration:
+                    print(f"\nForce registering image {imid} with {AP_info['num_inliers']} inliers")
+                    break
+                else:
+                    print(f"\nImage {imid} has too few inliers: {AP_info['num_inliers']}")
+                    return False
 
-            inlier_mask = AP_info["inlier_mask"]
-            ref_match_sizes = [len(pair2D3D[im_ref_id]["2d"]) for im_ref_id in stack_order]
-            split_indices = np.cumsum(ref_match_sizes)[:-1]
-            # mapping back masks to correspondences
-            t_mask = inlier_mask[: len(triangpts3D)]
-            l_mask = inlier_mask[len(triangpts3D) :]
-            remapped_inl_mask = np.ones(len(lifted_mask), dtype=bool)
-            remapped_inl_mask[lifted_mask] = l_mask
-            remapped_inl_mask[~lifted_mask] = t_mask[el_to_unique_index]
-            assert (
-                set(np.unique(ids3d[t_mask[el_to_unique_index]])) - set(unique_ids3d[inlier_mask[: len(triangpts3D)]])
-                == set()
-            )
-
-            split_mask = dict(zip(stack_order, np.split(remapped_inl_mask, split_indices)))
-            best_id = self.mpsfm_rec.best_next_ref_imid
-            self.mpsfm_rec.last_ap_inlier_masks = split_mask
-
-            if self.conf.resample_bunlde:
-                compare_ids = set(stack_order)
-                compare_ids.remove(best_id)
-                compare_ids = list(compare_ids)
-                print()
-                print("Best:", best_id, "other:", compare_ids)
-                print("_+_+_+_+_+_+" * 7)
-                print(
-                    "TOTS:",
-                    split_mask[best_id].sum(),
-                    "vs",
-                    [split_mask[im_ref_id].sum() for im_ref_id in compare_ids],
-                )
-                print(
-                    "RATIOS:",
-                    split_mask[best_id].sum() / len(split_mask[best_id]),
-                    "vs",
-                    [split_mask[im_ref_id].sum() / len(split_mask[im_ref_id]) for im_ref_id in compare_ids],
-                )
-                print("_+_+_+_+_+_+" * 7)
-                if (
-                    split_mask[best_id].sum() / len(split_mask[best_id]) < 0.1
-                    and np.nanmax(
-                        [split_mask[im_ref_id].sum() / len(split_mask[im_ref_id]) for im_ref_id in compare_ids]
-                    )
-                    > 0.2
-                ):
-                    for ref_id in split_mask:
-                        if len(split_mask[ref_id]) > 0:
-
-                            if ref_id in self.mpsfm_rec.images[imid].ignore_matches_AP:
-                                used = ~self.mpsfm_rec.images[imid].ignore_matches_AP[ref_id]
-                                self.mpsfm_rec.images[imid].ignore_matches_AP[ref_id][used] |= split_mask[ref_id]
-                            else:
-                                self.mpsfm_rec.images[imid].ignore_matches_AP[ref_id] = split_mask[ref_id]
-
-                    continue
+            image.cam_from_world = AP_info["cam_from_world"]
+            self.mpsfm_rec.register_image(imid)
             break
-
-        self.mpsfm_rec.images[imid].cam_from_world = AP_info["cam_from_world"]
-        self.mpsfm_rec.rec.register_image(imid)
 
         return True
 
