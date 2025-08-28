@@ -1,0 +1,4 @@
+# .yaml setup when images have different intrinsics
+1:
+  params: [1964.8828567888738, 1956.4745373457383, 1920, 1080] # fx, fy, cx, cy
+  images: all
