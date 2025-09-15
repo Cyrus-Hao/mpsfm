@@ -1,4 +1,3 @@
-import json
 import yaml
 import os
 import sys
@@ -11,11 +10,7 @@ CAMERA_MATRIX_CSV_PATH = "/root/autodl-tmp/mpsfm/local/example/36ba581007/camera
 ODOMETRY_CSV_PATH = "/root/autodl-tmp/mpsfm/local/example/36ba581007/odometry.csv"
 
 def rename_images_sequentially(images_dir: str) -> int:
-    """如果目录中有图片，则将其按排序重命名为 0,1,2...（保留扩展名）。
-    若目录不存在或无图片则不做处理。
-
-    返回重命名的文件数。
-    """
+    """将目录内图片重命名为 0..N-1，保留扩展名；若无图则返回 0。"""
     images_path = Path(images_dir)
     if not images_path.exists():
         return 0
@@ -44,7 +39,7 @@ def rename_images_sequentially(images_dir: str) -> int:
     return len(temp_files)
 
 def read_camera_matrix(csv_path):
-    """读取相机内参矩阵"""
+    """读取 3x3 相机内参矩阵"""
     try:
         with open(csv_path, 'r') as f:
             reader = csv.reader(f)
@@ -60,7 +55,7 @@ def read_camera_matrix(csv_path):
         return None
 
 def read_odometry_data(csv_path):
-    """读取里程计数据（相机外参）"""
+    """读取里程计 CSV（x,y,z,qx,qy,qz,qw）。"""
     try:
         odometry_data = []
         with open(csv_path, 'r') as f:
@@ -86,21 +81,17 @@ def read_odometry_data(csv_path):
         return []
 
 def quaternion_to_rotation_matrix(qx, qy, qz, qw):
-    """将四元数转换为旋转矩阵"""
-    # 归一化四元数
-    norm = np.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
-    qx, qy, qz, qw = qx/norm, qy/norm, qz/norm, qw/norm
-    
-    # 计算旋转矩阵
-    R = np.array([
+    """四元数(qx,qy,qz,qw)→R(3x3)。"""
+    n = np.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+    qx, qy, qz, qw = qx/n, qy/n, qz/n, qw/n
+    return np.array([
         [1-2*qy*qy-2*qz*qz, 2*qx*qy-2*qz*qw, 2*qx*qz+2*qy*qw],
         [2*qx*qy+2*qz*qw, 1-2*qx*qx-2*qz*qz, 2*qy*qz-2*qx*qw],
         [2*qx*qz-2*qy*qw, 2*qy*qz+2*qx*qw, 1-2*qx*qx-2*qy*qy]
     ])
-    return R
 
 def create_transform_matrix(x, y, z, qx, qy, qz, qw):
-    """创建4x4变换矩阵"""
+    """创建 4x4 变换矩阵。"""
     R = quaternion_to_rotation_matrix(qx, qy, qz, qw)
     t = np.array([x, y, z])
     
@@ -112,11 +103,9 @@ def create_transform_matrix(x, y, z, qx, qy, qz, qw):
     return transform.tolist()
 
 def process_csv_data(sample_interval=60):
-    """从CSV文件处理相机数据"""
-    print(f"读取相机内参矩阵: {CAMERA_MATRIX_CSV_PATH}")
+    """处理 CSV（固定 Twc 输入），输出 camera_poses 与 intrinsics。"""
     camera_matrix = read_camera_matrix(CAMERA_MATRIX_CSV_PATH)
     
-    print(f"读取里程计数据: {ODOMETRY_CSV_PATH}")
     odometry_data = read_odometry_data(ODOMETRY_CSV_PATH)
     
     if camera_matrix is None or not odometry_data:
@@ -129,18 +118,12 @@ def process_csv_data(sample_interval=60):
     cx = float(camera_matrix[0, 2])  # 主点x
     cy = float(camera_matrix[1, 2])  # 主点y
     
-    print(f"相机内参: fx={fx}, fy={fy}, cx={cx}, cy={cy}")
-    
     # 初始化输出数据
     camera_poses = {"camera_poses": {}}
     intrinsics = {}
     
     # 按间隔抽取里程计数据
     sampled_indices = list(range(0, len(odometry_data), sample_interval))
-    
-    print(f"里程计数据总帧数: {len(odometry_data)}")
-    print(f"抽取间隔: {sample_interval}帧")
-    print(f"抽取帧数: {len(sampled_indices)}")
     
     for frame_idx, data_idx in enumerate(sampled_indices):
         if data_idx >= len(odometry_data):
@@ -151,11 +134,15 @@ def process_csv_data(sample_interval=60):
         # 文件路径 - 使用简单的数字格式，从0开始
         file_path = f"images/{frame_idx}"  # 从0开始：0, 1, 2, ...
         
-        # 创建变换矩阵
-        transform_matrix = create_transform_matrix(
-            odom['x'], odom['y'], odom['z'],
-            odom['qx'], odom['qy'], odom['qz'], odom['qw']
-        )
+        # Twc -> 取逆得到 Tcw
+        R_wc = quaternion_to_rotation_matrix(odom['qx'], odom['qy'], odom['qz'], odom['qw'])
+        t_wc = np.array([odom['x'], odom['y'], odom['z']], dtype=float)
+        R_cw = R_wc.T
+        t_cw = -R_cw @ t_wc
+        T = np.eye(4)
+        T[:3, :3] = R_cw
+        T[:3, 3] = t_cw
+        transform_matrix = T.tolist()
         
         camera_poses["camera_poses"][file_path] = {
             "transform_matrix": transform_matrix
@@ -170,7 +157,7 @@ def process_csv_data(sample_interval=60):
     return camera_poses, intrinsics
 
 def save_files(camera_poses, intrinsics):
-    """保存YAML文件"""
+    """保存 YAML。"""
     output_dir = "/root/autodl-tmp/mpsfm/local/example"
     os.makedirs(output_dir, exist_ok=True)
     
@@ -182,14 +169,10 @@ def save_files(camera_poses, intrinsics):
     with open(f"{output_dir}/intrinsics.yaml", 'w', encoding='utf-8') as f:
         yaml.safe_dump(intrinsics, f, default_flow_style=False, allow_unicode=True)
     
-    print(f"已保存到: {output_dir}")
-    print(f"处理了 {len(intrinsics)} 个相机")
+    print(f"已保存到: {output_dir}，相机数: {len(intrinsics)}")
 
 if __name__ == "__main__":
-    # 默认使用CSV模式，默认60帧间隔
     sample_interval = 60
-    
-    # 如果提供了命令行参数，使用它作为抽取间隔
     if len(sys.argv) > 1:
         try:
             sample_interval = int(sys.argv[1])
@@ -198,13 +181,11 @@ if __name__ == "__main__":
             print(f"警告: 无效的抽取间隔 '{sys.argv[1]}'，使用默认值60")
     else:
         print("使用默认抽取间隔: 60帧")
-    
+
     try:
-        # 在开始主流程前尝试重命名图片
         rename_images_sequentially("/root/autodl-tmp/mpsfm/local/example/images")
         print("开始处理CSV数据...")
         camera_poses, intrinsics = process_csv_data(sample_interval)
-        
         if camera_poses and intrinsics:
             save_files(camera_poses, intrinsics)
             print("处理完成！")
