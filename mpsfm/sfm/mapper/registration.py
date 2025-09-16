@@ -155,52 +155,91 @@ class MpsfmRegistration(BaseClass):
 
     def register_and_triangulate_init_pair(self, imid1, imid2):
         """Register initial image pair and triangulate it's points."""
-        kwargs = {
-            "imid1": imid1,
-            "imid2": imid2,
-            "matches": self.correspondences.matches(imid1, imid2),
-            "kps1": self.mpsfm_rec.keypoints(imid1),
-            "kps2": self.mpsfm_rec.keypoints(imid2),
-            "camera1": self.mpsfm_rec.camera(imid1),
-            "camera2": self.mpsfm_rec.camera(imid2),
-        }
-        candidate_points, cam_from_world2 = self._init_pair_points_and_pose(**kwargs)
-        
-        # 检查是否有先验外参
-        image1_name = self.mpsfm_rec.images[imid1].name
-        image2_name = self.mpsfm_rec.images[imid2].name
-        
-        # 设置初始外参
-        if self.has_prior_pose(image1_name):
-            prior_pose1 = self.get_prior_pose(image1_name)
-            self.mpsfm_rec.images[imid1].cam_from_world = prior_pose1
+        matches = self.correspondences.matches(imid1, imid2)
+        kps1 = self.mpsfm_rec.keypoints(imid1)
+        kps2 = self.mpsfm_rec.keypoints(imid2)
+        camera1 = self.mpsfm_rec.camera(imid1)
+        camera2 = self.mpsfm_rec.camera(imid2)
+
+        # 相对位姿
+        E_info = self.relative_pose_estimator(kps1[matches[:, 0]], kps2[matches[:, 1]], camera1, camera2)
+        inlier_matches = matches[E_info["inlier_mask"]]
+
+        # 最终位姿（先验优先）
+        # 查询是否有prior
+        name1 = self.mpsfm_rec.images[imid1].name
+        name2 = self.mpsfm_rec.images[imid2].name
+        has_p1, has_p2 = self.has_prior_pose(name1), self.has_prior_pose(name2)
+        T_c1w = self.get_prior_pose(name1) if has_p1 else pycolmap.Rigid3d()
+        T_c2c1 = E_info["cam2_from_cam1"]
+        T_c2w0 = self.get_prior_pose(name2) if has_p2 else (T_c2c1 * T_c1w)
+
+        # 以最终世界系评估视差 & AP（lifted 显式转世界）
+        pts_tri0 = self._candidate_points3D_for_init(
+            T_c1w, T_c2w0, inlier_matches, self.mpsfm_rec.images[imid1], self.mpsfm_rec.images[imid2], camera1, camera2
+        )
+        unproj_cam, valid_lifted = self._lift_points_for_init(imid1, kps1, camera1)
+        valid_matches = matches[valid_lifted[matches[:, 0]]]
+        unproj_world = T_c1w.inverse() * unproj_cam
+        AP_info = self.absolute_pose_estimator(kps2[valid_matches[:, 1]], unproj_world[valid_matches[:, 0]], camera2)
+        ap_min_num_inliers = self.conf.colmap_options.abs_pose_min_num_inliers
+        use_ap = (AP_info is not None) and (AP_info["num_inliers"] >= ap_min_num_inliers)
+        T_c2w = self.get_prior_pose(name2) if has_p2 else (AP_info["cam_from_world"] if use_ap else T_c2w0)
+
+        # 在最终位姿下生成候选（统一策略：AP 成功用 AP 内点，否则用 E 内点）
+        if len(pts_tri0["xyz"]) > 0:
+            tri_world = np.vstack(pts_tri0["xyz"])  # (N,3) 世界
+            tri_cam1 = T_c1w * tri_world
+            z = tri_cam1[:, -1]
+            mask = np.array(list(pts_tri0["pt2d_id_1"]))
+            d = self.mpsfm_rec.images[imid1].depth.data_prior_at_kps(kps1[mask])
+            rescale = np.median(z / d)
         else:
-            self.mpsfm_rec.images[imid1].cam_from_world = pycolmap.Rigid3d()
-        
-        if self.has_prior_pose(image2_name):
-            prior_pose2 = self.get_prior_pose(image2_name)
-            self.mpsfm_rec.images[imid2].cam_from_world = prior_pose2
-        else:
-            self.mpsfm_rec.images[imid2].cam_from_world = cam_from_world2
+            rescale = 1
+        unproj_cam, valid_lifted = self._lift_points_for_init(imid1, kps1, camera1, rescale=rescale)
+        matches_used = (valid_matches[AP_info["inlier_mask"]] if use_ap else inlier_matches)
+        unproj_world = T_c1w.inverse() * unproj_cam
+        pts_lift = self._candidate_lift_for_init(T_c1w, T_c2w, matches_used[valid_lifted[matches_used[:, 0]]], unproj_world)
+        pts_tri = self._candidate_points3D_for_init(
+            T_c1w, T_c2w, matches_used, self.mpsfm_rec.images[imid1], self.mpsfm_rec.images[imid2], camera1, camera2
+        )
+
+        # 合并
+        cand = {}
+        ids1, ids2 = pts_lift["pt2d_id_1"], pts_tri["pt2d_id_1"]
+        set1, set2 = set(ids1), set(ids2)
+        idx1 = [i for i, x in enumerate(ids1) if x not in set2]
+        idx2 = [i for i, x in enumerate(ids2) if x not in set1]
+        common = list(set1 & set2)
+        lift_com = {k: [v for v, i in zip(vals, ids1) if i in common] for k, vals in pts_lift.items()}
+        tri_com = {k: [v for v, i in zip(vals, ids2) if i in common] for k, vals in pts_tri.items()}
+        for k in pts_lift:
+            cand[k] = [a if t < self.conf.combined_triangle_thresh else b for (a, b, t) in zip(lift_com[k], tri_com[k], pts_tri["tri_angle"])]
+            cand[k] += [pts_lift[k][i] for i in idx1 if pts_lift["tri_angle"][i] < self.conf.combined_triangle_thresh]
+            cand[k] += [pts_tri[k][i] for i in idx2 if pts_tri["tri_angle"][i] >= self.conf.combined_triangle_thresh]
+
+        # 赋姿并注册
+        self.mpsfm_rec.images[imid1].cam_from_world = T_c1w
+        self.mpsfm_rec.images[imid2].cam_from_world = T_c2w
         
         self.mpsfm_rec.register_image(imid1)
         self.mpsfm_rec.register_image(imid2)
-        if len(candidate_points["xyz"]) < 3:
+        if len(cand["xyz"]) < 3:
             print(f"Init pair {imid1} and {imid2} has less than 3 points to triangulate. Not registered")
             return False
-        for i, xyz in enumerate(candidate_points["xyz"]):
+        for i, xyz in enumerate(cand["xyz"]):
             track = pycolmap.Track()
-            track.add_element(imid1, candidate_points["pt2d_id_1"][i])
-            track.add_element(imid2, candidate_points["pt2d_id_2"][i])
+            track.add_element(imid1, cand["pt2d_id_1"][i])
+            track.add_element(imid2, cand["pt2d_id_2"][i])
             if (
-                self.mpsfm_rec.images[imid1].points2D[candidate_points["pt2d_id_1"][i]].has_point3D()
-                or self.mpsfm_rec.images[imid2].points2D[candidate_points["pt2d_id_2"][i]].has_point3D()
+                self.mpsfm_rec.images[imid1].points2D[cand["pt2d_id_1"][i]].has_point3D()
+                or self.mpsfm_rec.images[imid2].points2D[cand["pt2d_id_2"][i]].has_point3D()
             ):
                 continue
             if (
-                self.conf.colmap_options.init_min_tri_angle < candidate_points["tri_angle"][i]
-                and candidate_points["posdepth1"][i]
-                and candidate_points["posdepth2"][i]
+                self.conf.colmap_options.init_min_tri_angle < cand["tri_angle"][i]
+                and cand["posdepth1"][i]
+                and cand["posdepth2"][i]
             ):
                 self.mpsfm_rec.obs.add_point3D(xyz, track)
         return not len(self.mpsfm_rec.points3D) < 3
@@ -362,7 +401,7 @@ class MpsfmRegistration(BaseClass):
         if AP_info is not None and self.conf.verbose > 1:
             print(f"\t       num AP inliers: {AP_info['num_inliers']}")
         if high_parallax:
-            cam_form_world2 = E_info["cam2_from_cam1"]
+            cam_from_world2 = E_info["cam2_from_cam1"]
 
             # gathering lifted and triangulated points
             triangulated_z = np.vstack(points_triangulated["xyz"])[:, -1]
@@ -372,18 +411,18 @@ class MpsfmRegistration(BaseClass):
             unproj_3D1, valid_lifted = self._lift_points_for_init(imid1, kps1, camera1, rescale=rescale)
             valid_matches = inlier_matches[valid_lifted[inlier_matches[:, 0]]]
             points_lifted = self._candidate_lift_for_init(
-                pycolmap.Rigid3d(), cam_form_world2, valid_matches, unproj_3D1
+                pycolmap.Rigid3d(), cam_from_world2, valid_matches, unproj_3D1
             )
 
         else:
-            cam_form_world2 = AP_info["cam_from_world"]
+            cam_from_world2 = AP_info["cam_from_world"]
             points_lifted = self._candidate_lift_for_init(
-                pycolmap.Rigid3d(), cam_form_world2, valid_matches, unproj_3D1, AP_info["inlier_mask"]
+                pycolmap.Rigid3d(), cam_from_world2, valid_matches, unproj_3D1, AP_info["inlier_mask"]
             )
             # gathering lifted and triangulated points
             points_triangulated = self._candidate_points3D_for_init(
                 pycolmap.Rigid3d(),
-                cam_form_world2,
+                cam_from_world2,
                 valid_matches[AP_info["inlier_mask"]],
                 self.mpsfm_rec.images[imid1],
                 self.mpsfm_rec.images[imid2],
@@ -408,7 +447,7 @@ class MpsfmRegistration(BaseClass):
             candidate_points[k] = [
                 a if tri_angle < self.conf.combined_triangle_thresh else b
                 for (a, b, tri_angle) in zip(
-                    common_points_lifted[k], common_points_triangulated[k], points_triangulated["tri_angle"]
+                    common_points_lifted[k], common_points_triangulated[k], common_points_triangulated["tri_angle"]
                 )
             ]
             candidate_points[k] += [
@@ -421,7 +460,7 @@ class MpsfmRegistration(BaseClass):
                 for i in indices2
                 if points_triangulated["tri_angle"][i] >= self.conf.combined_triangle_thresh
             ]
-        return candidate_points, cam_form_world2
+        return candidate_points, cam_from_world2
 
     def _collect_pairs(
         self, im_ref_id, image_ref, image, pts2d_ids_ref, pts2d_ids_qry, use_3d, point3D_ids, pair2D3D, **kwrags
