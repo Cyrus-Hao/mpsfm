@@ -91,9 +91,7 @@ class MpsfmRegistration(BaseClass):
     
     def get_prior_pose(self, image_name: str):
         """获取先验外参."""
-        if self.has_prior_pose(image_name):
-            return self.prior_poses[image_name]
-        return None
+        return self.prior_poses.get(image_name, None)
 
     @staticmethod
     def _candidate_points3D_for_init(
@@ -161,45 +159,106 @@ class MpsfmRegistration(BaseClass):
         camera1 = self.mpsfm_rec.camera(imid1)
         camera2 = self.mpsfm_rec.camera(imid2)
 
-        # 相对位姿
-        E_info = self.relative_pose_estimator(kps1[matches[:, 0]], kps2[matches[:, 1]], camera1, camera2)
-        inlier_matches = matches[E_info["inlier_mask"]]
-
-        # 最终位姿（先验优先）
-        # 查询是否有prior
+        # 先验优先：T2 的优先级为 prior2 > AP > E
         name1 = self.mpsfm_rec.images[imid1].name
         name2 = self.mpsfm_rec.images[imid2].name
-        has_p1, has_p2 = self.has_prior_pose(name1), self.has_prior_pose(name2)
-        T_c1w = self.get_prior_pose(name1) if has_p1 else pycolmap.Rigid3d()
-        T_c2c1 = E_info["cam2_from_cam1"]
-        T_c2w0 = self.get_prior_pose(name2) if has_p2 else (T_c2c1 * T_c1w)
+        prior1 = self.get_prior_pose(name1)
+        prior2 = self.get_prior_pose(name2)
 
-        # 以最终世界系评估视差 & AP（lifted 显式转世界）
-        pts_tri0 = self._candidate_points3D_for_init(
-            T_c1w, T_c2w0, inlier_matches, self.mpsfm_rec.images[imid1], self.mpsfm_rec.images[imid2], camera1, camera2
-        )
-        unproj_cam, valid_lifted = self._lift_points_for_init(imid1, kps1, camera1)
-        valid_matches = matches[valid_lifted[matches[:, 0]]]
-        unproj_world = T_c1w.inverse() * unproj_cam
-        AP_info = self.absolute_pose_estimator(kps2[valid_matches[:, 1]], unproj_world[valid_matches[:, 0]], camera2)
-        ap_min_num_inliers = self.conf.colmap_options.abs_pose_min_num_inliers
-        use_ap = (AP_info is not None) and (AP_info["num_inliers"] >= ap_min_num_inliers)
-        T_c2w = self.get_prior_pose(name2) if has_p2 else (AP_info["cam_from_world"] if use_ap else T_c2w0)
+        T_c1w = prior1 if prior1 is not None else pycolmap.Rigid3d()
 
-        # 在最终位姿下生成候选（统一策略：AP 成功用 AP 内点，否则用 E 内点）
-        if len(pts_tri0["xyz"]) > 0:
-            tri_world = np.vstack(pts_tri0["xyz"])  # (N,3) 世界
-            tri_cam1 = T_c1w * tri_world
-            z = tri_cam1[:, -1]
-            mask = np.array(list(pts_tri0["pt2d_id_1"]))
-            d = self.mpsfm_rec.images[imid1].depth.data_prior_at_kps(kps1[mask])
-            rescale = np.median(z / d)
+        matches_used = None
+        T_c2w = None
+        rescale = 1
+        unproj_cam_cached = None
+        valid_lifted_cached = None
+
+        if prior2 is not None:
+            # 完全跳过 AP 和 E，直接使用先验
+            T_c2w = prior2
+            # 用先验位姿直接三角化，估计尺度用于lifted重标定（可选，存在三角化成功时）
+            pts_tri_prior = self._candidate_points3D_for_init(
+                T_c1w, T_c2w, matches, self.mpsfm_rec.images[imid1], self.mpsfm_rec.images[imid2], camera1, camera2
+            )
+            if len(pts_tri_prior["xyz"]) > 0:
+                tri_world = np.vstack(pts_tri_prior["xyz"])  # (N,3) 世界
+                tri_cam1 = T_c1w * tri_world
+                z = tri_cam1[:, -1]
+                mask = np.array(list(pts_tri_prior["pt2d_id_1"]))
+                d = self.mpsfm_rec.images[imid1].depth.data_prior_at_kps(kps1[mask])
+                rescale = np.median(z / d)
+            matches_used = matches
         else:
-            rescale = 1
-        unproj_cam, valid_lifted = self._lift_points_for_init(imid1, kps1, camera1, rescale=rescale)
-        matches_used = (valid_matches[AP_info["inlier_mask"]] if use_ap else inlier_matches)
+            # 先尝试 AP（若有 prior1 则在其世界系下，否则 cam1 世界系为单位）
+            unproj_cam0, valid_lifted0 = self._lift_points_for_init(imid1, kps1, camera1)
+            valid_matches0 = matches[valid_lifted0[matches[:, 0]]]
+            unproj_world0 = T_c1w.inverse() * unproj_cam0
+            AP_info = self.absolute_pose_estimator(
+                kps2[valid_matches0[:, 1]], unproj_world0[valid_matches0[:, 0]], camera2
+            )
+            ap_min_num_inliers = self.conf.colmap_options.abs_pose_min_num_inliers
+            ap_sufficient = (AP_info is not None) and (AP_info["num_inliers"] >= ap_min_num_inliers)
+
+            if ap_sufficient:
+                # AP 充分：进行高/低视差判定（需一次 E 以获得三角角）
+                E_info = self.relative_pose_estimator(
+                    kps1[matches[:, 0]], kps2[matches[:, 1]], camera1, camera2
+                )
+                inlier_matches_e = matches[E_info["inlier_mask"]]
+                T_c2w_e = E_info["cam2_from_cam1"] * T_c1w
+                pts_tri_e = self._candidate_points3D_for_init(
+                    T_c1w, T_c2w_e, inlier_matches_e, self.mpsfm_rec.images[imid1], self.mpsfm_rec.images[imid2], camera1, camera2
+                )
+                triangles = np.array(pts_tri_e["tri_angle"]) if len(pts_tri_e["tri_angle"]) > 0 else np.array([])
+                high_parallax = (triangles > self.conf.parallax_thresh).sum() > AP_info["num_inliers"]
+
+                if high_parallax:
+                    # 高视差：采用 E 位姿与 E 内点，并用 E 三角化估计尺度
+                    T_c2w = T_c2w_e
+                    matches_used = inlier_matches_e
+                    if len(pts_tri_e["xyz"]) > 0:
+                        tri_world = np.vstack(pts_tri_e["xyz"])  # (N,3)
+                        tri_cam1 = T_c1w * tri_world
+                        z = tri_cam1[:, -1]
+                        mask = np.array(list(pts_tri_e["pt2d_id_1"]))
+                        d = self.mpsfm_rec.images[imid1].depth.data_prior_at_kps(kps1[mask])
+                        rescale = np.median(z / d)
+                else:
+                    # 低视差：采用 AP 位姿与 AP 内点，并复用此前 lift
+                    T_c2w = AP_info["cam_from_world"]
+                    matches_used = valid_matches0[AP_info["inlier_mask"]]
+                    rescale = 1
+                    unproj_cam_cached = unproj_cam0
+                    valid_lifted_cached = valid_lifted0
+            else:
+                # 回退到 E
+                E_info = self.relative_pose_estimator(
+                    kps1[matches[:, 0]], kps2[matches[:, 1]], camera1, camera2
+                )
+                inlier_matches = matches[E_info["inlier_mask"]]
+                T_c2w = E_info["cam2_from_cam1"] * T_c1w
+                matches_used = inlier_matches
+                # 用 E 位姿进行三角化，估计尺度
+                pts_tri_e = self._candidate_points3D_for_init(
+                    T_c1w, T_c2w, inlier_matches, self.mpsfm_rec.images[imid1], self.mpsfm_rec.images[imid2], camera1, camera2
+                )
+                if len(pts_tri_e["xyz"]) > 0:
+                    tri_world = np.vstack(pts_tri_e["xyz"])  # (N,3) 世界
+                    tri_cam1 = T_c1w * tri_world
+                    z = tri_cam1[:, -1]
+                    mask = np.array(list(pts_tri_e["pt2d_id_1"]))
+                    d = self.mpsfm_rec.images[imid1].depth.data_prior_at_kps(kps1[mask])
+                    rescale = np.median(z / d)
+
+        # 统一候选生成（若无需重标定且已有缓存，则复用 lift）
+        if rescale == 1 and unproj_cam_cached is not None:
+            unproj_cam, valid_lifted = unproj_cam_cached, valid_lifted_cached
+        else:
+            unproj_cam, valid_lifted = self._lift_points_for_init(imid1, kps1, camera1, rescale=rescale)
         unproj_world = T_c1w.inverse() * unproj_cam
-        pts_lift = self._candidate_lift_for_init(T_c1w, T_c2w, matches_used[valid_lifted[matches_used[:, 0]]], unproj_world)
+        pts_lift = self._candidate_lift_for_init(
+            T_c1w, T_c2w, matches_used[valid_lifted[matches_used[:, 0]]], unproj_world
+        )
         pts_tri = self._candidate_points3D_for_init(
             T_c1w, T_c2w, matches_used, self.mpsfm_rec.images[imid1], self.mpsfm_rec.images[imid2], camera1, camera2
         )
@@ -251,12 +310,11 @@ class MpsfmRegistration(BaseClass):
 
         # 检查是否有先验外参
         image_name = image.name
-        if self.has_prior_pose(image_name):
-            prior_pose = self.get_prior_pose(image_name)
-            if prior_pose is not None:
-                image.cam_from_world = prior_pose
-                self.mpsfm_rec.register_image(imid)
-                return True
+        prior_pose = self.get_prior_pose(image_name)
+        if prior_pose is not None:
+            image.cam_from_world = prior_pose
+            self.mpsfm_rec.register_image(imid)
+            return True
 
         if ref_imids is None:
             ref_imids = self.mpsfm_rec.registered_images.keys()
