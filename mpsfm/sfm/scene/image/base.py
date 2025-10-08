@@ -106,14 +106,15 @@ class Image(ColmapImageWrapper, BaseClass, Integration):
         else:
             raise ValueError(f"Unknown depth type: {self.conf.depth_type}")
         normals_dict = self.load_normals_data()
-        self.normals = Normals(
-            self.conf.normals,
-            normals_dict=normals_dict,
-            camera=camera,
-            continuity_mask=self.depth.continuity_mask,
-            mask=mask,
-            **kwargs,
-        )
+        if normals_dict is not None:
+            self.normals = Normals(
+                self.conf.normals,
+                normals_dict=normals_dict,
+                camera=camera,
+                continuity_mask=self.depth.continuity_mask,
+                mask=mask,
+                **kwargs,
+            )
 
     def load_depth_data(self, pairs_pth=None, **kwargs):
         """Load depth data from depth directory."""
@@ -125,6 +126,8 @@ class Image(ColmapImageWrapper, BaseClass, Integration):
 
     def load_normals_data(self):
         """Load normals data from normals directory."""
+        if self.normals_dir is None:
+            return None
         normals_dict = get_mono_map(self.normals_dir, self.imname)
         return normals_dict
 

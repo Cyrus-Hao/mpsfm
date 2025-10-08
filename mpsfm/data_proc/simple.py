@@ -31,11 +31,12 @@ class SimpleParser(BaseDatasetParser):
         self.imnames = imnames
         if intrinsics_pth is None:
             intrinsics_pth = Path(data_dir) / "intrinsics.yaml"
-            with open(intrinsics_pth, encoding="utf-8") as f:
-                intrinsics = yaml.safe_load(f)
+        with open(intrinsics_pth, encoding="utf-8") as f:
+            intrinsics = yaml.safe_load(f)
         if len(intrinsics) == 1:
-            assert intrinsics[1]["images"] == "all" or (
-                isinstance(intrinsics[1]["images"], list) and len(intrinsics[1]["images"]) == len(self.imnames)
+            only_key = next(iter(intrinsics))
+            assert intrinsics[only_key]["images"] == "all" or (
+                isinstance(intrinsics[only_key]["images"], list) and len(intrinsics[only_key]["images"]) == len(self.imnames)
             ), "If only one camera is provided, images must be 'all' or a list of all image names"
 
         image_id = 1

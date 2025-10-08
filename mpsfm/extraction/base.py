@@ -187,6 +187,13 @@ class Extraction(BaseClass):
             overwrite = True
         depth_conf = load_cfg(extract_mono.CONFIG_DIR / f"{self.conf.depth}.yaml")
         depth_conf.dataset = OmegaConf.merge(self.conf.dataset, depth_conf.dataset)
+        # Allow per-model overrides from top-level or under extractors, e.g.:
+        #   conf.promptda.{...} or conf.extractors.promptda.{...}
+        model_override = getattr(self.conf, self.conf.depth, None)
+        if model_override is None and hasattr(self.conf, "extractors"):
+            model_override = getattr(self.conf.extractors, self.conf.depth, None)
+        if model_override is not None:
+            depth_conf.model = OmegaConf.merge(depth_conf.model, model_override)
 
         self.depth_dir, model = extract_mono.main(
             depth_conf,
@@ -203,11 +210,20 @@ class Extraction(BaseClass):
 
     def extract_normals(self, overwrite=False):
         """Extract monocular normals."""
+        if self.conf.normals is None:
+            print("Skipping normals extraction (normals set to null)")
+            return None
         if any(s in self.extract for s in ["n", "normals"]):
             overwrite = True
         print(f"Extracting {self.conf.normals} normals...")
         normals_conf = load_cfg(gvars.MONO_MODEL_CONFIG_DIR / f"{self.conf.normals}.yaml")
         normals_conf.dataset = OmegaConf.merge(self.conf.dataset, normals_conf.dataset)
+        # Allow per-model overrides for normals as well from top-level or under extractors
+        model_override = getattr(self.conf, self.conf.normals, None)
+        if model_override is None and hasattr(self.conf, "extractors"):
+            model_override = getattr(self.conf.extractors, self.conf.normals, None)
+        if model_override is not None:
+            normals_conf.model = OmegaConf.merge(normals_conf.model, model_override)
         self.normals_dir, model = extract_mono.main(
             normals_conf,
             self.cache_dir,
