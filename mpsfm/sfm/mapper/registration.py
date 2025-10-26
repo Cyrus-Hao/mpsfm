@@ -78,7 +78,13 @@ class MpsfmRegistration(BaseClass):
                 rotation = pycolmap.Rotation3d(rotation_matrix)
                 rigid_pose = pycolmap.Rigid3d(rotation, translation)
                 
-                self.prior_poses[image_name] = rigid_pose
+                if image_name.startswith("images/"):
+                    stem = image_name.split("/")[-1]
+                    normalized_name = f"{stem}.png"
+                else:
+                    normalized_name = image_name
+                    
+                self.prior_poses[normalized_name] = rigid_pose
             
             print(f"Loaded {len(self.prior_poses)} prior poses from {pose_config_path}")
                 
