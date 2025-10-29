@@ -2,7 +2,7 @@ local/example/cache_dir/*
 local/weights/*
 local/example/sfm_outputs/*
 *.html
-
+local/example/*
 
 # BOILERPLATE
 __pycache__/

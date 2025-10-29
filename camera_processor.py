@@ -4,13 +4,68 @@ import sys
 import csv
 import numpy as np
 from pathlib import Path
+from PIL import Image
 
 # 可配置的CSV文件路径
-CAMERA_MATRIX_CSV_PATH = "/root/autodl-tmp/mpsfm/local/example/36ba581007/camera_matrix.csv"
-ODOMETRY_CSV_PATH = "/root/autodl-tmp/mpsfm/local/example/36ba581007/odometry.csv"
+CAMERA_MATRIX_CSV_PATH = "/root/autodl-tmp/mpsfm/local/example/99/camera_matrix.csv"
+ODOMETRY_CSV_PATH = "/root/autodl-tmp/mpsfm/local/example/99/odometry.csv"
+
+def convert_jpg_to_png(images_dir: str) -> int:
+    """检测并转换目录内所有 JPG/JPEG 图片为 PNG 格式。
+    
+    Args:
+        images_dir: 图片目录路径
+        
+    Returns:
+        转换的图片数量
+    """
+    images_path = Path(images_dir)
+    if not images_path.exists():
+        return 0
+    
+    # 查找所有 jpg/jpeg 图像
+    jpg_files = (
+        list(images_path.glob("*.jpg")) + 
+        list(images_path.glob("*.jpeg")) + 
+        list(images_path.glob("*.JPG")) + 
+        list(images_path.glob("*.JPEG"))
+    )
+    
+    if not jpg_files:
+        return 0
+    
+    print(f"检测到 {len(jpg_files)} 个 JPG/JPEG 图片，开始转换为 PNG...")
+    
+    converted_count = 0
+    for jpg_file in jpg_files:
+        try:
+            # 读取图像
+            img = Image.open(jpg_file)
+            
+            # 生成 PNG 文件名
+            png_file = jpg_file.with_suffix('.png')
+            
+            # 保存为 PNG
+            img.save(png_file, 'PNG')
+            
+            print(f"  ✓ {jpg_file.name} -> {png_file.name}")
+            
+            # 删除原始 JPG 文件
+            jpg_file.unlink()
+            
+            converted_count += 1
+            
+        except Exception as e:
+            print(f"  ✗ 转换失败 {jpg_file.name}: {e}")
+    
+    print(f"成功转换 {converted_count} 个图片为 PNG 格式")
+    return converted_count
 
 def rename_images_sequentially(images_dir: str) -> int:
-    """将目录内图片重命名为 0..N-1，保留扩展名；若无图则返回 0。"""
+    """将目录内图片重命名为 0..N-1，保留扩展名；若无图则返回 0。
+    
+    按照文件修改时间排序，确保每次运行顺序一致。
+    """
     images_path = Path(images_dir)
     if not images_path.exists():
         return 0
@@ -21,7 +76,8 @@ def rename_images_sequentially(images_dir: str) -> int:
     if not image_files:
         return 0
 
-    image_files.sort(key=lambda p: p.name)
+    # 按文件修改时间排序，确保每次运行顺序一致
+    image_files.sort(key=lambda p: p.stat().st_mtime)
 
     # 第一步：重命名为临时文件，避免命名冲突
     temp_files = []
@@ -172,7 +228,7 @@ def save_files(camera_poses, intrinsics):
     print(f"已保存到: {output_dir}，相机数: {len(intrinsics)}")
 
 if __name__ == "__main__":
-    sample_interval = 60
+    sample_interval = 1
     if len(sys.argv) > 1:
         try:
             sample_interval = int(sys.argv[1])
@@ -183,7 +239,15 @@ if __name__ == "__main__":
         print("使用默认抽取间隔: 60帧")
 
     try:
-        rename_images_sequentially("/root/autodl-tmp/mpsfm/local/example/images")
+        images_dir = "/root/autodl-tmp/mpsfm/local/example/images"
+        
+        # 第一步：转换 JPG 为 PNG（如果存在）
+        convert_jpg_to_png(images_dir)
+        
+        # 第二步：重命名图片
+        rename_images_sequentially(images_dir)
+        
+        # 第三步：处理 CSV 数据
         print("开始处理CSV数据...")
         camera_poses, intrinsics = process_csv_data(sample_interval)
         if camera_poses and intrinsics:
