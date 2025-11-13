@@ -11,6 +11,7 @@ CAMERA_MATRIX_CSV_PATH = "/root/autodl-tmp/mpsfm/local/example/99/camera_matrix.
 ODOMETRY_CSV_PATH = "/root/autodl-tmp/mpsfm/local/example/99/odometry.csv"
 
 def convert_jpg_to_png(images_dir: str) -> int:
+<<<<<<< HEAD
     """检测并转换目录内所有 JPG/JPEG 图片为 PNG 格式。
     
     Args:
@@ -19,6 +20,8 @@ def convert_jpg_to_png(images_dir: str) -> int:
     Returns:
         转换的图片数量
     """
+=======
+>>>>>>> 9fc09eb (Camera external parameters are transmitted to Tw2c)
     images_path = Path(images_dir)
     if not images_path.exists():
         return 0
@@ -62,10 +65,13 @@ def convert_jpg_to_png(images_dir: str) -> int:
     return converted_count
 
 def rename_images_sequentially(images_dir: str) -> int:
+<<<<<<< HEAD
     """将目录内图片重命名为 0..N-1，保留扩展名；若无图则返回 0。
     
     按照文件修改时间排序，确保每次运行顺序一致。
     """
+=======
+>>>>>>> 9fc09eb (Camera external parameters are transmitted to Tw2c)
     images_path = Path(images_dir)
     if not images_path.exists():
         return 0
@@ -115,18 +121,18 @@ def read_odometry_data(csv_path):
     try:
         odometry_data = []
         with open(csv_path, 'r') as f:
-            reader = csv.DictReader(f)
+            reader = csv.DictReader(f, skipinitialspace=True)
             for row in reader:
                 odometry_data.append({
                     'timestamp': float(row['timestamp']),
-                    'frame': row[' frame'].strip(),  # 处理列名中的空格
-                    'x': float(row[' x']),  # 处理列名中的空格
-                    'y': float(row[' y']),  # 处理列名中的空格
-                    'z': float(row[' z']),  # 处理列名中的空格
-                    'qx': float(row[' qx']),  # 处理列名中的空格
-                    'qy': float(row[' qy']),  # 处理列名中的空格
-                    'qz': float(row[' qz']),  # 处理列名中的空格
-                    'qw': float(row[' qw'])  # 处理列名中的空格
+                    'frame': row['frame'].strip(),
+                    'x': float(row['x']),
+                    'y': float(row['y']),
+                    'z': float(row['z']),
+                    'qx': float(row['qx']),
+                    'qy': float(row['qy']),
+                    'qz': float(row['qz']),
+                    'qw': float(row['qw'])
                 })
         return odometry_data
     except FileNotFoundError:
@@ -158,8 +164,7 @@ def create_transform_matrix(x, y, z, qx, qy, qz, qw):
     
     return transform.tolist()
 
-def process_csv_data(sample_interval=60):
-    """处理 CSV（固定 Twc 输入），输出 camera_poses 与 intrinsics。"""
+def process_csv_data(sample_interval=60, align_coordinate=None):
     camera_matrix = read_camera_matrix(CAMERA_MATRIX_CSV_PATH)
     
     odometry_data = read_odometry_data(ODOMETRY_CSV_PATH)
@@ -187,10 +192,10 @@ def process_csv_data(sample_interval=60):
             
         odom = odometry_data[data_idx]
         
-        # 文件路径 - 使用简单的数字格式，从0开始
-        file_path = f"images/{frame_idx}"  # 从0开始：0, 1, 2, ...
+        # 文件路径 - 使用 odometry 的帧名（支持零填充），示例：images/000000
+        frame_name = str(odom['frame']).strip()
+        file_path = f"images/{frame_name}"
         
-        # Twc -> 取逆得到 Tcw
         R_wc = quaternion_to_rotation_matrix(odom['qx'], odom['qy'], odom['qz'], odom['qw'])
         t_wc = np.array([odom['x'], odom['y'], odom['z']], dtype=float)
         R_cw = R_wc.T
@@ -207,7 +212,7 @@ def process_csv_data(sample_interval=60):
         # 相机内参（确保为原生float）
         intrinsics[frame_idx + 1] = {
             "params": [float(fx), float(fy), float(cx), float(cy)],
-            "images": [f"{frame_idx}.png"]  # 从0开始：0.png, 1.png, ...
+            "images": [f"{frame_name}.png"]
         }
     
     return camera_poses, intrinsics
@@ -229,6 +234,11 @@ def save_files(camera_poses, intrinsics):
 
 if __name__ == "__main__":
     sample_interval = 1
+<<<<<<< HEAD
+=======
+    align_coordinate = None
+    
+>>>>>>> 9fc09eb (Camera external parameters are transmitted to Tw2c)
     if len(sys.argv) > 1:
         try:
             sample_interval = int(sys.argv[1])
@@ -244,12 +254,16 @@ if __name__ == "__main__":
         # 第一步：转换 JPG 为 PNG（如果存在）
         convert_jpg_to_png(images_dir)
         
+<<<<<<< HEAD
         # 第二步：重命名图片
         rename_images_sequentially(images_dir)
         
         # 第三步：处理 CSV 数据
+=======
+        # 第二步：处理 CSV 数据（不重命名图片，直接使用零填充帧名）
+>>>>>>> 9fc09eb (Camera external parameters are transmitted to Tw2c)
         print("开始处理CSV数据...")
-        camera_poses, intrinsics = process_csv_data(sample_interval)
+        camera_poses, intrinsics = process_csv_data(sample_interval, align_coordinate)
         if camera_poses and intrinsics:
             save_files(camera_poses, intrinsics)
             print("处理完成！")
