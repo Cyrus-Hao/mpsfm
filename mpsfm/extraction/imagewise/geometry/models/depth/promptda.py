@@ -44,6 +44,10 @@ class PromptDA(BaseModel):
 
         depth_path = self.depth_dir / self.conf.pattern_depth.format(stem6=stem6, stem=stem)
         depth = self._read_depth(depth_path)
+        
+        # 应用 scale 参数
+        if self.conf.scale != 1:
+            depth = depth * self.conf.scale
 
         H, W = image.shape[:2]
         if depth.shape[:2] != (H, W):

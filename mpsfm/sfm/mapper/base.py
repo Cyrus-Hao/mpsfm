@@ -262,6 +262,12 @@ class MpsfmMapper(BaseClass):
                     success = self.post_init_refinement()
                     if not success:
                         self.log(f"Failed post init refinement for {init_pair}")
+                    else:
+                        # 初始对注册完成后，立即增量写出COLMAP模型
+                        try:
+                            self._write_colmap_incremental()
+                        except Exception:
+                            pass
                 if success and self.conf.depth_consistency and self.conf.depth_consistency_init:
                     success = self.depth_consistency_checker.check_init_pair(init_pair)
                     if not success:
@@ -375,11 +381,18 @@ class MpsfmMapper(BaseClass):
                     f"{self.mpsfm_rec.images[self.nextview.candid].name}"
                 )
                 continue
+            # snapshot dump disabled
             if not self.post_registration_refinement(
                 self.nextview.candid, check_depth_consistency=not self.depth_consistency_checker.skip_dc_check
             ):
                 self.at_registration_failure()
                 continue
+
+            # 每成功注册并完成一次本地优化，增量写出COLMAP模型
+            try:
+                self._write_colmap_incremental()
+            except Exception:
+                pass
 
             if not self.iterative_local_refinement(self.nextview.candid):
                 self.at_registration_failure()
@@ -413,6 +426,14 @@ class MpsfmMapper(BaseClass):
                 print(f"\t{image.cam_from_world}")
             print(50 * "-")
         return self.mpsfm_rec, True
+
+    # snapshot dump removed
+
+    def _write_colmap_incremental(self):
+        """将当前重建写入 data_dir/sfm_outputs/rec（COLMAP模型），每次覆盖。"""
+        out_dir = self.sfm_outputs_dir / "rec"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self.mpsfm_rec.rec.write(str(out_dir))
 
     # --- Optimization Utils ---
     def _refinement(self, bundle, int_covs, mode="global", refimid=None, allow_scale_filter=False, **kwargs):
@@ -502,11 +523,13 @@ class MpsfmMapper(BaseClass):
                     print("Failed to run global refinement")
                     return False
                 print("Image was deregistered during global refinement")
+            # 每轮后做坐标归一化（Sim3）。若使用先验外参，将在注册时把先验位姿映射到当前世界，避免坐标不一致
             self.mpsfm_rec.normalize()
             if changed == "deregistered" or changed < self.conf.colmap_options.ba_global_max_refinement_change:
                 if "param_multiplier" in kwargs:  # just to make sure all experiments are consistent
                     continue
                 break
+        # 最终阶段无需额外 normalize（上面每轮已执行过）；若仍希望末尾再归一化，可在此调用一次
         self.prev_num_reg_images = self.mpsfm_rec.num_reg_images()
         self.prev_num_num_points3D = self.mpsfm_rec.rec.num_points3D()
         return True
@@ -643,7 +666,30 @@ class MpsfmMapper(BaseClass):
         if mode == "global":
             self.optimizer.update_truncation_multiplier(self.mpsfm_rec.reg_image_ids())
         self.log("\tAdjusting bunlde...", tstart=True, level=1)
-        problem, success = self.optimizer.ba(bundle, mode=mode, allow_scale_filter=allow_scale_filter, **kwargs)
+        # 当使用 prior pose 时，仅对确有先验的图像固定位姿，避免影响无先验帧
+        fix_pose_for_ba = False
+        reg_conf = getattr(self.conf, "registration", None)
+        registration_module = getattr(self, "registration", None)
+        if reg_conf and registration_module:
+            use_prior = getattr(reg_conf, "use_prior_poses", False)
+            refine_prior = getattr(reg_conf, "ba_refine_prior_pose", False)
+            if use_prior and (not refine_prior):
+                prior_bound_imids = {
+                    imid
+                    for imid in bundle["optim_ids"]
+                    if imid in self.mpsfm_rec.images
+                    and registration_module.has_prior_pose(self.mpsfm_rec.images[imid].name)
+                }
+                if prior_bound_imids:
+                    fix_pose_for_ba = prior_bound_imids
+        
+        problem, success = self.optimizer.ba(
+            bundle,
+            mode=mode,
+            fix_pose=fix_pose_for_ba,
+            allow_scale_filter=allow_scale_filter,
+            **kwargs,
+        )
         self.log(tend=True, level=1)
 
         if not success:

@@ -26,6 +26,7 @@ class MpsfmRegistration(BaseClass):
         # 先验外参配置
         "use_prior_poses": False,  # 是否使用先验外参
         "pose_config_path": None,  # 外参配置文件路径
+        "ba_refine_prior_pose": True,
     }
 
     def _init(self, mpsfm_rec, correspondences, triangulator, **kwargs):
@@ -77,12 +78,12 @@ class MpsfmRegistration(BaseClass):
                 # 直接从旋转矩阵创建Rotation3d
                 rotation = pycolmap.Rotation3d(rotation_matrix)
                 rigid_pose = pycolmap.Rigid3d(rotation, translation)
-                
-                if image_name.startswith("images/"):
-                    stem = image_name.split("/")[-1]
-                    normalized_name = f"{stem}.png"
+                stem = image_name.split("/")[-1]
+                suffix = Path(stem).suffix.lower()
+                if suffix in {".png", ".jpg", ".jpeg", ".bmp"}:
+                    normalized_name = stem
                 else:
-                    normalized_name = image_name
+                    normalized_name = f"{stem}.png"
                     
                 self.prior_poses[normalized_name] = rigid_pose
             
@@ -129,6 +130,73 @@ class MpsfmRegistration(BaseClass):
             candidate_points["xyz"].append(out["xyz"])
         return candidate_points
 
+    def _inlier_mask_for_pair_under_pose(
+        self,
+        ref_imid,
+        qry_imid,
+        T_ref_cw,
+        T_qry_cw,
+        camera_ref,
+        camera_qry,
+        matches,
+        kps_ref,
+        kps_qry,
+        px_thresh,
+    ):
+        """在固定先验位姿下，对 (ref -> qry) 的匹配进行基于重投影误差的内点筛选。
+
+        流程：将参考图像的匹配像素用深度反投影到 ref 相机坐标系 -> 转世界系 -> 投影到 qry 相机，
+        与 qry 的匹配像素比较像素距离，结合正深度与深度有效性筛选内点。
+        """
+        if matches is None or len(matches) == 0:
+            return np.zeros(0, dtype=bool)
+
+        # 取出匹配到的参考/查询像素
+        ref_idx = matches[:, 0]
+        qry_idx = matches[:, 1]
+        xy_ref = kps_ref[ref_idx]
+        xy_qry = kps_qry[qry_idx]
+
+        # 融合策略：优先使用参考帧已有3D点的坐标；没有3D点的再用深度lift
+        image_ref = self.mpsfm_rec.images[ref_imid]
+        has3d = np.array([image_ref.points2D[int(pid)].has_point3D() for pid in ref_idx], dtype=bool)
+        use_p3d = has3d
+        use_lift = ~use_p3d
+
+        mask_out = np.zeros(len(matches), dtype=bool)
+
+        # 分支1：已有三角化3D点
+        if np.any(use_p3d):
+            p3d_ids = np.array([image_ref.points2D[int(pid)].point3D_id for pid in ref_idx[use_p3d]], dtype=int)
+            # 取世界坐标并投影到查询相机
+            xyz_world_p3d = np.array([self.mpsfm_rec.points3D[int(p)].xyz for p in p3d_ids])
+            xyz_qry_cam_p3d = T_qry_cw * xyz_world_p3d
+            valid_z = xyz_qry_cam_p3d[:, 2] > 0
+            if np.any(valid_z):
+                proj_qry_p3d = camera_qry.img_from_cam(xyz_qry_cam_p3d[valid_z])
+                errs_p3d = np.linalg.norm(proj_qry_p3d - xy_qry[use_p3d][valid_z], axis=1)
+                mloc = np.zeros(use_p3d.sum(), dtype=bool)
+                mloc[valid_z] = errs_p3d <= px_thresh
+                mask_out[np.where(use_p3d)[0]] = mloc
+
+        # 分支2：用参考帧深度进行lift
+        if np.any(use_lift):
+            xy_ref_l = xy_ref[use_lift]
+            unproj_cam, valid_lifted = self._lift_points_for_init(ref_imid, xy_ref_l, camera_ref)
+            if unproj_cam.shape[0] > 0:
+                xyz_world_l = T_ref_cw.inverse() * unproj_cam
+                xyz_qry_cam_l = T_qry_cw * xyz_world_l
+                valid_depth_qry = xyz_qry_cam_l[:, 2] > 0
+                valid_all = valid_lifted & valid_depth_qry
+                if np.any(valid_all):
+                    proj_qry_l = camera_qry.img_from_cam(xyz_qry_cam_l[valid_all])
+                    errs_l = np.linalg.norm(proj_qry_l - xy_qry[use_lift][valid_all], axis=1)
+                    mloc = np.zeros(use_lift.sum(), dtype=bool)
+                    mloc[valid_all] = errs_l <= px_thresh
+                    mask_out[np.where(use_lift)[0]] = mloc
+
+        return mask_out
+
     def _find_2D3D_pairs(self, im_ref_id, imid, image_ref, image, pair2D3D):
         corr = self.correspondences.matches(im_ref_id, imid)
         if im_ref_id in self.mpsfm_rec.images[image.imid].ignore_matches_AP:
@@ -156,7 +224,7 @@ class MpsfmRegistration(BaseClass):
             point3D_ids,
             pair2D3D,
         )
-
+    
     def register_and_triangulate_init_pair(self, imid1, imid2):
         """Register initial image pair and triangulate it's points."""
         matches = self.correspondences.matches(imid1, imid2)
@@ -170,8 +238,12 @@ class MpsfmRegistration(BaseClass):
         name2 = self.mpsfm_rec.images[imid2].name
         prior1 = self.get_prior_pose(name1)
         prior2 = self.get_prior_pose(name2)
+        
 
-        T_c1w = prior1 if prior1 is not None else pycolmap.Rigid3d()
+        if prior1 is not None:
+            T_c1w = self.mpsfm_rec.align_prior_pose_to_current_world(prior1)
+        else:
+            T_c1w = pycolmap.Rigid3d()
 
         matches_used = None
         T_c2w = None
@@ -181,7 +253,7 @@ class MpsfmRegistration(BaseClass):
 
         if prior2 is not None:
             # 完全跳过 AP 和 E，直接使用先验
-            T_c2w = prior2
+            T_c2w = self.mpsfm_rec.align_prior_pose_to_current_world(prior2)
             # 用先验位姿直接三角化，估计尺度用于lifted重标定（可选，存在三角化成功时）
             pts_tri_prior = self._candidate_points3D_for_init(
                 T_c1w, T_c2w, matches, self.mpsfm_rec.images[imid1], self.mpsfm_rec.images[imid2], camera1, camera2
@@ -193,7 +265,28 @@ class MpsfmRegistration(BaseClass):
                 mask = np.array(list(pts_tri_prior["pt2d_id_1"]))
                 d = self.mpsfm_rec.images[imid1].depth.data_prior_at_kps(kps1[mask])
                 rescale = np.median(z / d)
-            matches_used = matches
+            
+            # 基于先验位姿计算 inlier mask（用于内点筛选与DC重采样）
+            px_thresh = getattr(self.conf.colmap_options, "abs_pose_max_error", 4.0)
+            prior_inlier_mask = self._inlier_mask_for_pair_under_pose(
+                imid1,
+                imid2,
+                T_c1w,
+                T_c2w,
+                camera1,
+                camera2,
+                matches,
+                kps1,
+                kps2,
+                px_thresh,
+            )
+            # suppress prior inlier summary printing
+            # 保存为“当前（imid2）相对参考（imid1）”的内点掩码，供 DC 失败时使用
+            self.mpsfm_rec.last_ap_inlier_masks = {imid1: prior_inlier_mask}
+            # 采用先验内点作为初始匹配，若过少则退回全部匹配
+            ap_min_num_inliers = self.conf.colmap_options.abs_pose_min_num_inliers
+            matches_used = matches[prior_inlier_mask] if prior_inlier_mask.sum() >= max(3, ap_min_num_inliers // 2) else matches
+            
         else:
             # 先尝试 AP（若有 prior1 则在其世界系下，否则 cam1 世界系为单位）
             unproj_cam0, valid_lifted0 = self._lift_points_for_init(imid1, kps1, camera1)
@@ -204,6 +297,14 @@ class MpsfmRegistration(BaseClass):
             )
             ap_min_num_inliers = self.conf.colmap_options.abs_pose_min_num_inliers
             ap_sufficient = (AP_info is not None) and (AP_info["num_inliers"] >= ap_min_num_inliers)
+            try:
+                ap_inl = AP_info["num_inliers"] if AP_info is not None else 0
+                self.log(
+                    f"[AP] ap_inliers={ap_inl}, ap_min_required={ap_min_num_inliers}, ap_sufficient={ap_sufficient}",
+                    level=0,
+                )
+            except Exception:
+                pass
 
             if ap_sufficient:
                 # AP 充分：进行高/低视差判定（需一次 E 以获得三角角）
@@ -318,7 +419,49 @@ class MpsfmRegistration(BaseClass):
         image_name = image.name
         prior_pose = self.get_prior_pose(image_name)
         if prior_pose is not None:
-            image.cam_from_world = prior_pose
+            image.cam_from_world = self.mpsfm_rec.align_prior_pose_to_current_world(prior_pose)
+
+            # 在使用先验直接注册前，生成与所有参考图像的 inlier masks
+            if ref_imids is None:
+                ref_imids = self.mpsfm_rec.registered_images.keys()
+            ref_imids = list(ref_imids)
+
+            px_thresh = getattr(self.conf.colmap_options, "abs_pose_max_error", 4.0)
+            kps_qry = self.mpsfm_rec.keypoints(imid)
+            camera_qry = camera
+            inlier_masks_map = {}
+            total_matches_cnt = 0
+            total_inliers_cnt = 0
+            for ref_id in ref_imids:
+                image_ref = self.mpsfm_rec.images[ref_id]
+                camera_ref = self.mpsfm_rec.rec.cameras[image_ref.camera_id]
+                matches_ref_qry = self.correspondences.matches(ref_id, imid)
+                if len(matches_ref_qry) == 0:
+                    inlier_masks_map[ref_id] = np.zeros(0, dtype=bool)
+                    continue
+                kps_ref = self.mpsfm_rec.keypoints(ref_id)
+                # 简化策略：重投影一律使用参考帧“当前估计位姿”（已被BA优化过的 cam_from_world）
+                T_ref_cw = image_ref.cam_from_world
+                T_qry_cw = image.cam_from_world
+                mask = self._inlier_mask_for_pair_under_pose(
+                    ref_id,
+                    imid,
+                    T_ref_cw,
+                    T_qry_cw,
+                    camera_ref,
+                    camera_qry,
+                    matches_ref_qry,
+                    kps_ref,
+                    kps_qry,
+                    px_thresh,
+                )
+                inlier_masks_map[ref_id] = mask
+                total_matches_cnt += len(matches_ref_qry)
+                total_inliers_cnt += int(mask.sum())
+
+            # 供 DC 失败时移除“好内点”使用
+            self.mpsfm_rec.last_ap_inlier_masks = inlier_masks_map
+            # 最后注册图像
             self.mpsfm_rec.register_image(imid)
             return True
 
@@ -552,8 +695,7 @@ class MpsfmRegistration(BaseClass):
                 )
 
             pair2D3D["lifted"] = ~use_3d
-            if len(point3D_ids) != (~pair2D3D["lifted"]).sum():
-                print("here")
+            # 若 lifted/3D 数量不匹配，后续流程会在断言处报错
         if not self.conf.lifted_registration:
             pair2D3D["3d"] = pair2D3D["3d"][use_3d]
             pair2D3D["2d"] = pair2D3D["2d"][use_3d]

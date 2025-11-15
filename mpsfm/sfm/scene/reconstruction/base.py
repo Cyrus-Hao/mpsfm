@@ -45,6 +45,11 @@ class MpsfmReconstruction(BaseClass, ColmapReconstructionWrapper, Reconstruction
         self.refrec_dir = None
         self.references = None
         self.images_dir = None
+        # 累计的世界系相似变换（来自多次 normalize）：x' = s_total * x + t_total
+        # 用于将先验外参从“原世界系”映射到“当前世界系”
+        self.world_sim_scale = 1.0
+        self.world_sim_translation = np.zeros(3, dtype=float)
+        self.world_sim_rotation = np.eye(3, dtype=float)
 
     @property
     def image_ids(self) -> list[int]:
@@ -116,9 +121,49 @@ class MpsfmReconstruction(BaseClass, ColmapReconstructionWrapper, Reconstruction
     def normalize(self):
         """Normalizes reconstruction"""
         sim3d = self.rec.normalize(False, 5, 0.2, 0.8, False)
-        scale, _ = sim3d.scale, sim3d.translation
+        scale, translation = sim3d.scale, sim3d.translation
+        # 若返回含旋转，获取旋转矩阵；否则使用单位阵
+        try:
+            Rg = sim3d.rotation.matrix() if hasattr(sim3d, "rotation") else np.eye(3, dtype=float)
+        except Exception:
+            Rg = np.eye(3, dtype=float)
+        # 组合累计 Sim3：
+        # S_total' = (s, Rg, t) ∘ S_total
+        # s_tot = s * s_tot
+        # R_tot = Rg * R_tot
+        # t_tot = s * (Rg * t_tot) + t
+        try:
+            self.world_sim_translation = scale * (Rg @ self.world_sim_translation) + translation
+            self.world_sim_rotation = Rg @ self.world_sim_rotation
+            self.world_sim_scale *= scale
+        except Exception:
+            pass
+        # 同步深度尺度到新的世界尺度
         self.normalize_depths(scale)
         return True
+
+    def align_prior_pose_to_current_world(self, pose: pycolmap.Rigid3d) -> pycolmap.Rigid3d:
+        """将先验位姿（定义在原世界系）映射到当前世界系。
+
+        通用 Sim3（s_tot, R_tot, t_tot）对应关系：
+        R'_cw = R_cw * R_tot^T
+        t'_cw = s_tot * t_cw - R'_cw * t_tot
+        """
+        try:
+            s = float(self.world_sim_scale)
+            t = np.asarray(self.world_sim_translation, dtype=float)
+            R_tot = np.asarray(self.world_sim_rotation, dtype=float)
+            R_cw = pose.rotation
+            t_cw = pose.translation
+            # R'_cw = R_cw * R_tot^T
+            R_new_mat = R_cw.matrix() @ R_tot.T
+            R_new = pycolmap.Rotation3d(R_new_mat)
+            # t'_cw = s * t_cw - R'_cw * t_tot
+            t_new = s * t_cw - (R_new * t)
+            
+            return pycolmap.Rigid3d(R_new, t_new)
+        except Exception:
+            return pose
 
     def cache_depths(self, priors_dir: Path):
         with h5py.File(priors_dir, "w") as f:

@@ -69,6 +69,10 @@ class DepthUtils:
             self.images[imid].depth.data = self.images[imid].depth.data * scale + shift
 
         self.images[imid].depth.uncertainty_update *= scale**2
+        # 裁剪不确定性，避免多次重标定导致过度放大/缩小，引起深度项权重退化
+        uu = self.images[imid].depth.uncertainty_update
+        # 在合理范围内裁剪（数值可根据数据集再调）
+        self.images[imid].depth.uncertainty_update = np.clip(uu, 1e-8, 1e4)
 
     def rescale_all(self, shift_scales):
         """Rescales all depths i.e. priors and optimized depths"""

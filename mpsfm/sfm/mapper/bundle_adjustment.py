@@ -90,7 +90,7 @@ class Optimizer(BaseClass):
     def __build_problem(
             self,
             bundle,  # 字典 包含optim_ids（待优化图像的 ID 列表） pts3D（待优化的 3D 点 ID 集合） ref_id（参考图像 ID，用于尺度一致性）
-            fix_pose,  # 是否固定相机姿态（旋转和位移）
+            fix_pose,  # 是否固定相机姿态，可以为 bool 或包含特定 imid 的 Iterable
             fix_scale,  # 是否固定深度图的尺度
             mode=None,  #
             depth_loss_name=None,  # 指定深度优化的损失函数类型 none为默认cauchy
@@ -103,6 +103,15 @@ class Optimizer(BaseClass):
 
         conf = self.conf  # 获取default_conf配置 例如 depth_loss_name="cauchy", reproj_loss_name="SOFT_L1"
         optim_ids = list(bundle["optim_ids"])  # 从 bundle["optim_ids"] 获取待优化图像 ID 列表
+        fixed_pose_ids: set[int] = set()
+        if isinstance(fix_pose, bool):
+            if fix_pose:
+                fixed_pose_ids = set(optim_ids)
+        elif fix_pose is not None:
+            try:
+                fixed_pose_ids = {int(i) for i in fix_pose}
+            except TypeError:
+                fixed_pose_ids = {int(fix_pose)}
         depth_loss_name = depth_loss_name or conf.depth_loss_name  # 未指定则用cauchy
         depth_loss_type = self.get_loss[
             depth_loss_name]  # 通过 self.get_loss 映射到 pycolmap.LossFunctionType（如 CAUCHY）算是自己写的函数与pycolmap库函数链接？
@@ -145,20 +154,7 @@ class Optimizer(BaseClass):
         for ii, imid in enumerate(optim_ids):
             image = self.mpsfm_rec.images[imid]
             pose = image.cam_from_world
-            # 若 fix_pose=True 或为第一帧（ii == 0） 固定相机旋转（pose.rotation.quat）和位移（pose.translation）
-            if fix_pose or ii == 0:
-                problem.set_parameter_block_constant(pose.rotation.quat)
-                problem.set_parameter_block_constant(pose.translation)
-
-            else:
-                # 对于第二帧（ii == 1）固定位移的第一个分量（SubsetManifold(3, [0])）可能用于固定尺度
-                if ii == 1:
-                    problem.set_manifold(
-                        pose.translation, pyceres.SubsetManifold(3, [0])
-                    )
-                    # 使用 EigenQuaternionManifold 确保旋转（四元数）的正确性
-                problem.set_manifold(pose.rotation.quat, pyceres.EigenQuaternionManifold())
-            # 处理深度数据
+            # 处理深度数据（先添加残差，确保相关参数块已被注册）
             # 跳过未激活深度
             if not image.depth.activated:
                 continue
@@ -183,6 +179,8 @@ class Optimizer(BaseClass):
             # 异常值过滤
             # 初始掩码剔除非正深度
             mask = depths > 0
+            # 同时剔除投影为负的 3D 深度（点在相机后方）
+            mask *= depth3d > 0
             # 尺度过滤 上面代码参数所示 仅保留比率在 [1/1.5, 1.5]内的点
             if allow_scale_filter and self.conf.scale_filter:
                 div = depths / depth3d
@@ -231,16 +229,26 @@ class Optimizer(BaseClass):
                 fix_scale=fix_scale,
                 logloss=True,
             )
-            # 固定尺度参数
-            fix_shiftscale = [0]
-            if fix_scale:
-                # 固定 shift_scale 的平移（[0]）和尺度（[1]
-                fix_shiftscale.append(1)
-            if len(fix_shiftscale) > 0:
-                # 用 SubsetManifold 约束优化变量
-                problem.set_manifold(shift_scale[imid], pyceres.SubsetManifold(2, fix_shiftscale))
-                # 求解优化问题
-                self.solve(problem)
+            # 仅在尺度为自由变量时设置流形（shift 固定、scale 自由）
+            if not fix_scale:
+                problem.set_manifold(shift_scale[imid], pyceres.SubsetManifold(2, [0]))
+            # 在残差加入后再约束相机位姿（确保参数块已存在）
+            should_fix_pose = (imid in fixed_pose_ids) or (ii == 0)
+            if should_fix_pose:
+                try:
+                    problem.set_parameter_block_constant(pose.rotation.quat)
+                    problem.set_parameter_block_constant(pose.translation)
+                except Exception:
+                    pass
+            else:
+                try:
+                    if ii == 1:
+                        problem.set_manifold(pose.translation, pyceres.SubsetManifold(3, [0]))
+                    problem.set_manifold(pose.rotation.quat, pyceres.EigenQuaternionManifold())
+                except Exception:
+                    pass
+        # 一次性求解：在完成所有图像的残差与流形设置后再统一求解
+        self.solve(problem)
         return bundler, shift_scale
 
     # 用于构建深度图尺度和偏移优化问题
@@ -259,12 +267,14 @@ class Optimizer(BaseClass):
         metric_scale_factor = self.conf.metric_scale_filter
         # 是否对所有图像应用单一尺度调整
         single_rescale = self.conf.single_rescale
+        # 简化策略：逐图像中位数估计 + 必要的保护打印
 
         for kwargs in self.__yield_problem_parameters(
                 bundle["optim_ids"], proj_depths=scale_filter or metric_scale_factor
         ):
             pose = kwargs["image"].cam_from_world
             imid, p3dids = kwargs["imid"], kwargs["pt3D_ids"]
+            base_valid = kwargs["valid"].copy()
             if (scale_filter_factor or metric_scale_factor) and (
                     "ref_id" in bundle and imid != bundle["ref_id"] and single_rescale
             ):
@@ -275,35 +285,38 @@ class Optimizer(BaseClass):
                     and metric_scale_factor  # 启用了度量尺度过滤
                     and ((imid == bundle["ref_id"]) or (not single_rescale))  # 当前图像是参考图像或未启用单一尺度调整
             ):
-                # 计算scale（投影深度与观测深度的比率） 避免除零
-                scale = kwargs["projdepths"] / (kwargs["obsdepths"].clip(1e-6, None))
-                # 获取当前图像的深度尺度
-                im_scale = self.mpsfm_rec.images[imid].depth.scale
-                # 计算提议尺度
-                proposed_scale = scale * im_scale
-                # 计算其他优化图像的平均尺度map_scale
-                map_scale = np.mean(
-                    [self.mpsfm_rec.images[id].depth.scale for id in bundle["optim_ids"] if id != imid]
-                )
-                # 计算尺度比率
-                div = map_scale / proposed_scale
-                # 标记尺度比率在合理范围内的点为valid
-                valid = (div < 1.5) * (div > (1 / 1.5))
-
-                presum = kwargs["valid"].sum()
-
-                kwargs["valid"] = kwargs["valid"] * valid
-                # 如果没有有效点 打印警告
-                if kwargs["valid"].sum() == 0:
-                    print("WARNING: Settin all points as outliers for metric scale optim and using map scale!!")
-                    # 使用平均尺度 map_scale
-                    shift_scale[imid] = np.array([0.0, np.log(map_scale / self.mpsfm_rec.images[imid].depth.scale)])
-                    return shift_scale, True
-                self.log(
-                    f"Setting {presum - kwargs['valid'].sum()}"
-                    f"points as outliers for metric scale optim, out of {presum}",
-                    level=3,
-                )
+                # 计算其他优化图像的平均尺度map_scale；若没有“其他图像”，则跳过度量尺度过滤
+                other_scales = [self.mpsfm_rec.images[id].depth.scale for id in bundle["optim_ids"] if id != imid]
+                if len(other_scales) > 0:
+                    # 计算scale（投影深度与观测深度的比率） 避免除零
+                    scale = kwargs["projdepths"] / (kwargs["obsdepths"].clip(1e-6, None))
+                    # 获取当前图像的深度尺度
+                    im_scale = self.mpsfm_rec.images[imid].depth.scale
+                    # 计算提议尺度
+                    proposed_scale = scale * im_scale
+                    # 计算其他优化图像的平均尺度map_scale
+                    map_scale = np.mean(other_scales)
+                    # 计算尺度比率
+                    proposed_scale = np.clip(proposed_scale, 1e-6, None)
+                    div = map_scale / proposed_scale
+                    div[~np.isfinite(div)] = np.inf
+                    # 标记尺度比率在合理范围内的点为valid
+                    valid_metric = (div < 1.5) & (div > (1 / 1.5))
+                    filtered_valid = base_valid & valid_metric
+                    # 如果全部被过滤，回退到原始有效集，避免后续没有尺度约束
+                    if filtered_valid.sum() == 0:
+                        self.log(
+                            f"Metric scale filter dropped all points for imid={imid}; falling back to unfiltered set",
+                            level=2,
+                        )
+                        kwargs["valid"] = base_valid
+                    else:
+                        removed = base_valid.sum() - filtered_valid.sum()
+                        kwargs["valid"] = filtered_valid
+                        self.log(
+                            f"Setting {removed} points as outliers for metric scale optim, out of {base_valid.sum()}",
+                            level=3,
+                        )
             # 如果启用了尺度过滤且未启用度量尺度过滤
             if allow_scale_filter and scale_filter and not allow_metric_scale_filter:
                 div = kwargs["obsdepths"] / kwargs["projdepths"]
@@ -315,14 +328,20 @@ class Optimizer(BaseClass):
             # 获取三维点坐标
             p3d = self.mpsfm_rec.point3D_coordinates(p3dids)
             # 计算三维点在相机坐标系中的深度（z 坐标） pose 是相机从世界坐标系的变换矩阵
-            z = (pose * p3d)[:, -1]
+            z_full = (pose * p3d)[:, -1]
+            # 同时要求观测有效且投影深度为正
+            valid_mask = kwargs["valid"] * (z_full > 0)
             # 提取有效点的投影深度 z 和观测深度 odepth
-            z = z[kwargs["valid"]]
-            odepth = kwargs["obsdepths"][kwargs["valid"]]
-            # 计算提议的尺度参数 取对数比率的中值 避免除零
-            proposed = np.median(np.log(((z / odepth)).clip(1e-6, None)))
+            z = z_full[valid_mask]
+            odepth = kwargs["obsdepths"][valid_mask]
+            # 计算对数尺度样本与调试打印
+            log_ratios = np.log(((z / odepth)).clip(1e-6, None))
+            if log_ratios.shape[0] == 0:
+                continue
+            proposed = np.median(log_ratios)
             # 偏移设为 0，尺度为对数形式
             shift_scale[imid] = np.array([0.0, proposed])
+
         return shift_scale, True
 
     # 该段代码主要是用于计算给定bundle中 3D 点的协方差
@@ -354,8 +373,18 @@ class Optimizer(BaseClass):
 
     # 对整个重建进行光束法平差 优化每帧的相机位姿（外参）和 3D 点位置
     def ba(self, bundle, mode, **kwargs) -> tuple[Problem, bool]:
-        # 允许优化相机位姿（旋转和平移）和固定深度图的尺度（不优化尺度参数）
-        problem, _ = self.__build_problem(bundle, fix_pose=False, fix_scale=True, mode=mode, **kwargs)
+        # 防御性处理：避免在调用方通过 **kwargs 同时传入 fix_pose/fix_scale/mode 而造成重复关键字
+        fix_pose = kwargs.pop("fix_pose", False)
+        fix_scale = kwargs.pop("fix_scale", True)
+        mode_val = kwargs.pop("mode", mode)
+        # 允许优化相机位姿（旋转和平移）并在默认情况下固定深度图的尺度（可被调用方覆盖）
+        problem, _ = self.__build_problem(
+            bundle,
+            fix_pose=fix_pose,
+            fix_scale=fix_scale,
+            mode=mode_val,
+            **kwargs,
+        )
         return problem, True
 
     # 优化每帧深度图的尺度和偏移参数 并将深度图标记为“激活”
@@ -369,6 +398,9 @@ class Optimizer(BaseClass):
 
     # 固定相机位姿 仅优化三角化的 3D 点位置 结合深度图先验（如果已激活）或 仅最小化重投影误差
     def refine_3d_points(self, bundle, **kwargs) -> tuple[Problem, bool]:
+        # 防御性处理：调用方若携带 fix_pose/fix_scale，避免与本函数的显式指定重复
+        kwargs.pop("fix_pose", None)
+        kwargs.pop("fix_scale", None)
         problem, _ = self.__build_problem(
             # 固定相机位姿和深度图尺度
             bundle, fix_pose=True, fix_scale=True, depth_loss_name=self.conf.ref3d_loss_name, **kwargs
