@@ -235,18 +235,12 @@ class Optimizer(BaseClass):
             # 在残差加入后再约束相机位姿（确保参数块已存在）
             should_fix_pose = (imid in fixed_pose_ids) or (ii == 0)
             if should_fix_pose:
-                try:
-                    problem.set_parameter_block_constant(pose.rotation.quat)
-                    problem.set_parameter_block_constant(pose.translation)
-                except Exception:
-                    pass
+                problem.set_parameter_block_constant(pose.rotation.quat)
+                problem.set_parameter_block_constant(pose.translation)
             else:
-                try:
-                    if ii == 1:
-                        problem.set_manifold(pose.translation, pyceres.SubsetManifold(3, [0]))
-                    problem.set_manifold(pose.rotation.quat, pyceres.EigenQuaternionManifold())
-                except Exception:
-                    pass
+                if ii == 1:
+                    problem.set_manifold(pose.translation, pyceres.SubsetManifold(3, [0]))
+                problem.set_manifold(pose.rotation.quat, pyceres.EigenQuaternionManifold())
         # 一次性求解：在完成所有图像的残差与流形设置后再统一求解
         self.solve(problem)
         return bundler, shift_scale
