@@ -11,7 +11,6 @@ CAMERA_MATRIX_CSV_PATH = "/root/autodl-tmp/mpsfm/local/example/99/camera_matrix.
 ODOMETRY_CSV_PATH = "/root/autodl-tmp/mpsfm/local/example/99/odometry.csv"
 
 def convert_jpg_to_png(images_dir: str) -> int:
-<<<<<<< HEAD
     """检测并转换目录内所有 JPG/JPEG 图片为 PNG 格式。
     
     Args:
@@ -20,8 +19,6 @@ def convert_jpg_to_png(images_dir: str) -> int:
     Returns:
         转换的图片数量
     """
-=======
->>>>>>> 9fc09eb (Camera external parameters are transmitted to Tw2c)
     images_path = Path(images_dir)
     if not images_path.exists():
         return 0
@@ -65,13 +62,10 @@ def convert_jpg_to_png(images_dir: str) -> int:
     return converted_count
 
 def rename_images_sequentially(images_dir: str) -> int:
-<<<<<<< HEAD
     """将目录内图片重命名为 0..N-1，保留扩展名；若无图则返回 0。
     
     按照文件修改时间排序，确保每次运行顺序一致。
     """
-=======
->>>>>>> 9fc09eb (Camera external parameters are transmitted to Tw2c)
     images_path = Path(images_dir)
     if not images_path.exists():
         return 0
@@ -234,11 +228,7 @@ def save_files(camera_poses, intrinsics):
 
 if __name__ == "__main__":
     sample_interval = 1
-<<<<<<< HEAD
-=======
     align_coordinate = None
-    
->>>>>>> 9fc09eb (Camera external parameters are transmitted to Tw2c)
     if len(sys.argv) > 1:
         try:
             sample_interval = int(sys.argv[1])
@@ -254,14 +244,7 @@ if __name__ == "__main__":
         # 第一步：转换 JPG 为 PNG（如果存在）
         convert_jpg_to_png(images_dir)
         
-<<<<<<< HEAD
-        # 第二步：重命名图片
-        rename_images_sequentially(images_dir)
-        
-        # 第三步：处理 CSV 数据
-=======
         # 第二步：处理 CSV 数据（不重命名图片，直接使用零填充帧名）
->>>>>>> 9fc09eb (Camera external parameters are transmitted to Tw2c)
         print("开始处理CSV数据...")
         camera_poses, intrinsics = process_csv_data(sample_interval, align_coordinate)
         if camera_poses and intrinsics:
