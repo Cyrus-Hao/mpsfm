@@ -141,59 +141,104 @@ class MpsfmRegistration(BaseClass):
         matches,
         kps_ref,
         kps_qry,
-        px_thresh,
     ):
         """在固定先验位姿下，对 (ref -> qry) 的匹配进行基于重投影误差的内点筛选。
 
-        流程：将参考图像的匹配像素用深度反投影到 ref 相机坐标系 -> 转世界系 -> 投影到 qry 相机，
-        与 qry 的匹配像素比较像素距离，结合正深度与深度有效性筛选内点。
+        先将参考帧可用的三角化点与深度 lift 点合并，再统一进行重投影误差筛选。
         """
+        px_thresh = 12.0  # 默认重投影阈值
         if matches is None or len(matches) == 0:
             return np.zeros(0, dtype=bool)
 
-        # 取出匹配到的参考/查询像素
-        ref_idx = matches[:, 0]
-        qry_idx = matches[:, 1]
+        ref_idx = matches[:, 0].astype(int)
+        qry_idx = matches[:, 1].astype(int)
         xy_ref = kps_ref[ref_idx]
         xy_qry = kps_qry[qry_idx]
-
-        # 融合策略：优先使用参考帧已有3D点的坐标；没有3D点的再用深度lift
-        image_ref = self.mpsfm_rec.images[ref_imid]
-        has3d = np.array([image_ref.points2D[int(pid)].has_point3D() for pid in ref_idx], dtype=bool)
-        use_p3d = has3d
-        use_lift = ~use_p3d
-
         mask_out = np.zeros(len(matches), dtype=bool)
 
-        # 分支1：已有三角化3D点
-        if np.any(use_p3d):
-            p3d_ids = np.array([image_ref.points2D[int(pid)].point3D_id for pid in ref_idx[use_p3d]], dtype=int)
-            # 取世界坐标并投影到查询相机
-            xyz_world_p3d = np.array([self.mpsfm_rec.points3D[int(p)].xyz for p in p3d_ids])
-            xyz_qry_cam_p3d = T_qry_cw * xyz_world_p3d
-            valid_z = xyz_qry_cam_p3d[:, 2] > 0
-            if np.any(valid_z):
-                proj_qry_p3d = camera_qry.img_from_cam(xyz_qry_cam_p3d[valid_z])
-                errs_p3d = np.linalg.norm(proj_qry_p3d - xy_qry[use_p3d][valid_z], axis=1)
-                mloc = np.zeros(use_p3d.sum(), dtype=bool)
-                mloc[valid_z] = errs_p3d <= px_thresh
-                mask_out[np.where(use_p3d)[0]] = mloc
+        pair_to_indices = defaultdict(list)
+        for midx, pair in enumerate(zip(ref_idx, qry_idx)):
+            pair_to_indices[(int(pair[0]), int(pair[1]))].append(midx)
 
-        # 分支2：用参考帧深度进行lift
-        if np.any(use_lift):
-            xy_ref_l = xy_ref[use_lift]
-            unproj_cam, valid_lifted = self._lift_points_for_init(ref_imid, xy_ref_l, camera_ref)
-            if unproj_cam.shape[0] > 0:
-                xyz_world_l = T_ref_cw.inverse() * unproj_cam
-                xyz_qry_cam_l = T_qry_cw * xyz_world_l
-                valid_depth_qry = xyz_qry_cam_l[:, 2] > 0
-                valid_all = valid_lifted & valid_depth_qry
-                if np.any(valid_all):
-                    proj_qry_l = camera_qry.img_from_cam(xyz_qry_cam_l[valid_all])
-                    errs_l = np.linalg.norm(proj_qry_l - xy_qry[use_lift][valid_all], axis=1)
-                    mloc = np.zeros(use_lift.sum(), dtype=bool)
-                    mloc[valid_all] = errs_l <= px_thresh
-                    mask_out[np.where(use_lift)[0]] = mloc
+        image_ref = self.mpsfm_rec.images[ref_imid]
+        projection_center_ref = T_ref_cw.rotation.inverse() * -T_ref_cw.translation
+        projection_center_qry = T_qry_cw.rotation.inverse() * -T_qry_cw.translation
+
+        def _tri_angle_deg(xyz_world):
+            return np.rad2deg(
+                calculate_triangulation_angle(projection_center_ref, projection_center_qry, xyz_world)
+            )
+
+        has3d = np.array([image_ref.points2D[int(pid)].has_point3D() for pid in ref_idx], dtype=bool)
+        tri_candidates = []
+        if np.any(has3d):
+            p3d_ids = np.array([image_ref.points2D[int(pid)].point3D_id for pid in ref_idx[has3d]], dtype=int)
+            xyz_world_p3d = np.array([self.mpsfm_rec.points3D[int(pid)].xyz for pid in p3d_ids])
+            for rid, qid, xyz in zip(ref_idx[has3d], qry_idx[has3d], xyz_world_p3d):
+                tri_candidates.append(
+                    {
+                        "pt2d_id_1": int(rid),
+                        "pt2d_id_2": int(qid),
+                        "xyz": np.asarray(xyz, dtype=np.float64),
+                        "tri_angle": _tri_angle_deg(xyz),
+                    }
+                )
+
+        lift_candidates = []
+        unproj_cam, valid_lifted = self._lift_points_for_init(ref_imid, xy_ref, camera_ref)
+        if unproj_cam.shape[0] > 0:
+            xyz_world_l = T_ref_cw.inverse() * unproj_cam
+            for rid, qid, xyz, valid_flag in zip(ref_idx, qry_idx, xyz_world_l, valid_lifted):
+                if not valid_flag:
+                    continue
+                lift_candidates.append(
+                    {
+                        "pt2d_id_1": int(rid),
+                        "pt2d_id_2": int(qid),
+                        "xyz": np.asarray(xyz, dtype=np.float64),
+                        "tri_angle": _tri_angle_deg(xyz),
+                    }
+                )
+
+        def _combine_candidates(tri_list, lift_list):
+            combined = []
+            tri_map = {cand["pt2d_id_1"]: cand for cand in tri_list}
+            lift_map = {cand["pt2d_id_1"]: cand for cand in lift_list}
+            thresh = self.conf.combined_triangle_thresh
+            all_refs = set(tri_map.keys()) | set(lift_map.keys())
+            for ref_id in all_refs:
+                tri_c = tri_map.get(ref_id)
+                lift_c = lift_map.get(ref_id)
+                if tri_c and lift_c:
+                    combined.append(tri_c if tri_c["tri_angle"] >= thresh else lift_c)
+                elif tri_c:
+                    if tri_c["tri_angle"] >= thresh:
+                        combined.append(tri_c)
+                elif lift_c:
+                    if lift_c["tri_angle"] < thresh:
+                        combined.append(lift_c)
+            return combined
+
+        combined_candidates = _combine_candidates(tri_candidates, lift_candidates)
+        if len(combined_candidates) == 0:
+            return mask_out
+
+        xyz_world = np.array([cand["xyz"] for cand in combined_candidates])
+        xy_qry_target = np.array([kps_qry[cand["pt2d_id_2"]] for cand in combined_candidates])
+        xyz_qry_cam = T_qry_cw * xyz_world
+        valid_depth = xyz_qry_cam[:, 2] > 0
+        reproj_errs = np.full(len(combined_candidates), np.inf, dtype=np.float64)
+        if np.any(valid_depth):
+            proj_qry = camera_qry.img_from_cam(xyz_qry_cam[valid_depth])
+            reproj_errs[valid_depth] = np.linalg.norm(proj_qry - xy_qry_target[valid_depth], axis=1)
+        inlier_flags = reproj_errs <= px_thresh
+
+        for cand, is_inlier in zip(combined_candidates, inlier_flags):
+            if not is_inlier:
+                continue
+            pair = (cand["pt2d_id_1"], cand["pt2d_id_2"])
+            for match_idx in pair_to_indices.get(pair, []):
+                mask_out[match_idx] = True
 
         return mask_out
 
@@ -267,7 +312,6 @@ class MpsfmRegistration(BaseClass):
                 rescale = np.median(z / d)
             
             # 基于先验位姿计算 inlier mask（用于内点筛选与DC重采样）
-            px_thresh = getattr(self.conf.colmap_options, "abs_pose_max_error", 4.0)
             prior_inlier_mask = self._inlier_mask_for_pair_under_pose(
                 imid1,
                 imid2,
@@ -278,7 +322,6 @@ class MpsfmRegistration(BaseClass):
                 matches,
                 kps1,
                 kps2,
-                px_thresh,
             )
             # suppress prior inlier summary printing
             # 保存为“当前（imid2）相对参考（imid1）”的内点掩码，供 DC 失败时使用
@@ -426,7 +469,6 @@ class MpsfmRegistration(BaseClass):
                 ref_imids = self.mpsfm_rec.registered_images.keys()
             ref_imids = list(ref_imids)
 
-            px_thresh = getattr(self.conf.colmap_options, "abs_pose_max_error", 4.0)
             kps_qry = self.mpsfm_rec.keypoints(imid)
             camera_qry = camera
             inlier_masks_map = {}
@@ -453,7 +495,6 @@ class MpsfmRegistration(BaseClass):
                     matches_ref_qry,
                     kps_ref,
                     kps_qry,
-                    px_thresh,
                 )
                 inlier_masks_map[ref_id] = mask
                 total_matches_cnt += len(matches_ref_qry)
