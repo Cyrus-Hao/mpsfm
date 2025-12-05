@@ -1,8 +1,11 @@
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pycolmap
+from scipy.optimize import least_squares
+from scipy.spatial.transform import Rotation
 
 from mpsfm.baseclass import BaseClass
 from mpsfm.sfm.estimators import AbsolutePose, RelativePose
@@ -28,6 +31,11 @@ class MpsfmRegistration(BaseClass):
         "use_prior_poses": False,  # 是否使用先验外参
         "pose_config_path": None,  # 外参配置文件路径
         "ba_refine_prior_pose": True,
+        # 初始化先验精调
+        "refine_init_prior_pose": True,
+        "epipolar_refine_min_matches": 12,
+        "epipolar_refine_max_iters": 300,
+        "lifted_debug_log_path": str(Path(__file__).resolve().parents[3] / "lifted_debug_log.txt"),
     }
 
     def _init(self, mpsfm_rec, correspondences, triangulator, **kwargs):
@@ -101,6 +109,215 @@ class MpsfmRegistration(BaseClass):
         """获取先验外参."""
         return self.prior_poses.get(image_name, None)
 
+    def _write_lifted_debug_log(self, tag: str, stats: dict):
+        log_path = getattr(self.conf, "lifted_debug_log_path", None)
+        if not log_path:
+            return
+        try:
+            path = Path(log_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().isoformat(timespec="seconds")
+            payload = ", ".join(f"{key}={value}" for key, value in stats.items())
+            line = f"[{timestamp}] {tag}: {payload}\n"
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception as exc:
+            self.log(f"[LiftedDebug] failed to log {tag}: {exc}", level=2)
+
+    def _log_refine_skip(self, ref_imid, qry_imid, reason, extra=None):
+        payload = {"stage": "init_pair", "reason": reason}
+        if extra:
+            payload.update(extra)
+        self._write_lifted_debug_log(f"prior_pose_refine_{ref_imid}_{qry_imid}", payload)
+
+    @staticmethod
+    def _skew(vec):
+        x, y, z = vec
+        return np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]], dtype=np.float64)
+
+    @staticmethod
+    def _normalize_translation(t):
+        norm = np.linalg.norm(t)
+        if norm < 1e-9:
+            return t
+        return t / norm
+
+    def _normalized_keypoints(self, camera, keypoints):
+        if len(keypoints) == 0:
+            return np.zeros((0, 3), dtype=np.float64)
+        pts = np.asarray(keypoints, dtype=np.float64)
+        ones = np.ones((pts.shape[0], 1), dtype=np.float64)
+        pts_h = np.hstack([pts, ones])
+        K = np.asarray(camera.calibration_matrix(), dtype=np.float64)
+        K_inv = np.linalg.inv(K)
+        rays = (K_inv @ pts_h.T).T
+        return rays
+
+    @staticmethod
+    def _relative_pose_components(T_c1w: pycolmap.Rigid3d, T_c2w: pycolmap.Rigid3d):
+        R1 = T_c1w.rotation.matrix()
+        t1 = np.array(T_c1w.translation, dtype=np.float64)
+        R2 = T_c2w.rotation.matrix()
+        t2 = np.array(T_c2w.translation, dtype=np.float64)
+        R_rel = R2 @ R1.T
+        t_rel = t2 - R_rel @ t1
+        return R_rel, t_rel
+
+    @staticmethod
+    def _compose_left_se3_delta(R_rel, t_rel, delta):
+        rot_update = Rotation.from_rotvec(delta[:3]).as_matrix()
+        trans_update = delta[3:]
+        R_new = rot_update @ R_rel
+        t_new = rot_update @ t_rel + trans_update
+        return R_new, t_new
+
+    def _essential_from_rt(self, R_rel, t_rel):
+        return self._skew(t_rel) @ R_rel
+
+    def _epipolar_residuals(self, R_rel, t_rel, pts1, pts2):
+        E = self._essential_from_rt(R_rel, t_rel)
+        Ex1 = (E @ pts1.T).T
+        Etx2 = (E.T @ pts2.T).T
+        numerators = np.einsum("ij,ij->i", pts2, Ex1)
+        denom = Ex1[:, 0] ** 2 + Ex1[:, 1] ** 2 + Etx2[:, 0] ** 2 + Etx2[:, 1] ** 2 + 1e-12
+        return numerators / np.sqrt(denom)
+
+    def _refine_init_pair_pose_epipolar(
+        self, ref_imid, qry_imid, T_c1w, T_c2w, matches, kps1, kps2, camera1, camera2
+    ):
+        if not self.conf.refine_init_prior_pose:
+            self._log_refine_skip(ref_imid, qry_imid, "disabled")
+            return T_c2w, False, {}
+        matches = np.asarray(matches)
+        min_matches = self.conf.epipolar_refine_min_matches
+        if len(matches) < min_matches:
+            self._log_refine_skip(
+                ref_imid,
+                qry_imid,
+                "insufficient_matches",
+                {"num_matches": int(len(matches)), "required": int(min_matches)},
+            )
+            return T_c2w, False, {}
+
+        pts1 = self._normalized_keypoints(camera1, kps1[matches[:, 0]])
+        pts2 = self._normalized_keypoints(camera2, kps2[matches[:, 1]])
+        if len(pts1) < min_matches:
+            self._log_refine_skip(
+                ref_imid,
+                qry_imid,
+                "insufficient_normalized_matches",
+                {"num_matches": int(len(pts1)), "required": int(min_matches)},
+            )
+            return T_c2w, False, {}
+
+        R_rel, t_rel = self._relative_pose_components(T_c1w, T_c2w)
+        baseline_norm = float(np.linalg.norm(t_rel))
+        if baseline_norm < 1e-9:
+            self._log_refine_skip(
+                ref_imid, qry_imid, "zero_baseline", {"baseline_norm": baseline_norm, "num_matches": int(len(pts1))}
+            )
+            return T_c2w, False, {}
+        t_rel = self._normalize_translation(t_rel)
+
+        def residual(delta):
+            R_curr, t_curr = self._compose_left_se3_delta(R_rel, t_rel, delta)
+            t_curr = self._normalize_translation(t_curr)
+            return self._epipolar_residuals(R_curr, t_curr, pts1, pts2)
+
+        def residual_stats(R_mat, t_vec):
+            res = self._epipolar_residuals(R_mat, t_vec, pts1, pts2)
+            if len(res) == 0:
+                return {
+                    "count": 0,
+                    "rms": 0.0,
+                    "abs_mean": 0.0,
+                    "abs_median": 0.0,
+                    "abs_p95": 0.0,
+                    "abs_max": 0.0,
+                }
+            abs_res = np.abs(res)
+            return {
+                "count": int(len(res)),
+                "rms": float(np.sqrt(np.mean(res**2))),
+                "abs_mean": float(np.mean(abs_res)),
+                "abs_median": float(np.median(abs_res)),
+                "abs_p95": float(np.percentile(abs_res, 95)),
+                "abs_max": float(np.max(abs_res)),
+            }
+
+        stats_before = residual_stats(R_rel, t_rel)
+
+        try:
+            result = least_squares(
+                residual,
+                np.zeros(6, dtype=np.float64),
+                method="lm",
+                max_nfev=self.conf.epipolar_refine_max_iters,
+            )
+        except Exception as exc:
+            self.log(f"[InitPair] Epipolar refine failed: {exc}", level=1)
+            payload = {
+                "error": str(exc),
+                "baseline_norm": baseline_norm,
+                "residual_before_rms": stats_before["rms"],
+                "num_matches": stats_before["count"],
+            }
+            self._log_refine_skip(ref_imid, qry_imid, "solver_exception", payload)
+            return T_c2w, False, {}
+
+        if not result.success:
+            R_tmp, t_tmp = self._compose_left_se3_delta(R_rel, t_rel, result.x)
+            t_tmp = self._normalize_translation(t_tmp)
+            stats_tmp = residual_stats(R_tmp, t_tmp)
+            payload = {
+                "message": getattr(result, "message", ""),
+                "status": getattr(result, "status", None),
+                "baseline_norm": baseline_norm,
+                "residual_before_rms": stats_before["rms"],
+                "residual_current_rms": stats_tmp["rms"],
+                "residual_current_p95": stats_tmp["abs_p95"],
+                "nfev": int(result.nfev),
+                "max_nfev": int(self.conf.epipolar_refine_max_iters),
+            }
+            self._log_refine_skip(ref_imid, qry_imid, "solver_failed", payload)
+            return T_c2w, False, {}
+
+        R_opt, t_opt = self._compose_left_se3_delta(R_rel, t_rel, result.x)
+        t_opt_unit = self._normalize_translation(t_opt)
+        stats_after = residual_stats(R_opt, t_opt_unit)
+
+        rot_delta = R_opt @ R_rel.T
+        rot_diff = Rotation.from_matrix(rot_delta)
+        rot_diff_deg = float(np.rad2deg(rot_diff.magnitude()))
+        trans_angle = float(
+            np.rad2deg(
+                np.arccos(
+                    np.clip(
+                        np.dot(t_rel, t_opt_unit) / (np.linalg.norm(t_rel) * np.linalg.norm(t_opt_unit)), -1.0, 1.0
+                    )
+                )
+            )
+        )
+
+        refine_stats = {
+            "num_matches": stats_before["count"],
+            "baseline_norm": baseline_norm,
+            "residual_before_rms": stats_before["rms"],
+            "residual_before_p95": stats_before["abs_p95"],
+            "residual_before_max": stats_before["abs_max"],
+            "residual_after_rms": stats_after["rms"],
+            "residual_after_p95": stats_after["abs_p95"],
+            "residual_after_max": stats_after["abs_max"],
+            "rot_diff_deg": rot_diff_deg,
+            "trans_angle_deg": trans_angle,
+            "nfev": int(result.nfev),
+        }
+
+        refined_translation = t_opt_unit * baseline_norm
+        refined_relative = pycolmap.Rigid3d(pycolmap.Rotation3d(R_opt), refined_translation)
+        refined_pose = refined_relative * T_c1w
+        return refined_pose, True, refine_stats
+
     @staticmethod
     def _candidate_points3D_for_init(
         cam_from_world1, cam_from_world2, matches, image1, image2, camera1, camera2, inliers=None
@@ -142,6 +359,7 @@ class MpsfmRegistration(BaseClass):
         matches,
         kps_ref,
         kps_qry,
+        log_stage=None,
     ):
         """在固定先验位姿下，对 (ref -> qry) 的匹配进行基于重投影误差的内点筛选。
 
@@ -180,6 +398,8 @@ class MpsfmRegistration(BaseClass):
 
         lift_candidates = []
         unproj_cam, valid_lifted = self._lift_points_for_init(ref_imid, xy_ref, camera_ref)
+        lift_candidate_total = int(len(valid_lifted))
+        lift_depth_valid = int(np.count_nonzero(valid_lifted))
         if unproj_cam.shape[0] > 0:
             xyz_world_l = T_ref_cw.inverse() * unproj_cam
             for rid, qid, xyz, valid_flag in zip(ref_idx, qry_idx, xyz_world_l, valid_lifted):
@@ -210,7 +430,27 @@ class MpsfmRegistration(BaseClass):
             return combined
 
         combined_candidates = _combine_candidates(tri_candidates, lift_candidates)
-        if len(combined_candidates) == 0:
+        combined_total = len(combined_candidates)
+        if combined_total == 0:
+            stats = {
+                    "combined": 0,
+                    "depth_reject": 0,
+                    "depth_valid": 0,
+                    "lift_candidates": lift_candidate_total,
+                    "lift_depth_valid": 0,
+                    "lift_inliers": 0,
+                    "lift_kept": 0,
+                    "matches": len(matches),
+                    "reproj_inliers": 0,
+                    "reproj_reject": len(matches),
+                    "tri_candidates": len(tri_candidates),
+                    "tri_depth_valid": 0,
+                    "tri_inliers": 0,
+                    "tri_kept": len(tri_candidates),
+                }
+            if log_stage is not None:
+                stats["stage"] = log_stage
+            self._write_lifted_debug_log(f"prior_mask_ref{ref_imid}_qry{qry_imid}", stats)
             return mask_out
 
         xyz_world = np.array([cand["xyz"] for cand in combined_candidates])
@@ -231,6 +471,37 @@ class MpsfmRegistration(BaseClass):
             pair = (cand["pt2d_id_1"], cand["pt2d_id_2"])
             for match_idx in pair_to_indices.get(pair, []):
                 mask_out[match_idx] = True
+
+        depth_valid = int(np.count_nonzero(valid_depth))
+        depth_reject = combined_total - depth_valid
+        lift_candidates_kept = int(np.count_nonzero(is_lift))
+        tri_candidates_kept = int(np.count_nonzero(is_tri))
+        lift_depth_valid_final = int(np.count_nonzero(is_lift & valid_depth))
+        tri_depth_valid_final = int(np.count_nonzero(is_tri & valid_depth))
+        lift_inliers = int(np.count_nonzero(is_lift & inlier_flags))
+        tri_inliers = int(np.count_nonzero(is_tri & inlier_flags))
+        reproj_inliers = int(np.count_nonzero(mask_out))
+        reproj_reject = len(matches) - reproj_inliers
+
+        stats = {
+            "combined": combined_total,
+            "depth_reject": depth_reject,
+            "depth_valid": depth_valid,
+            "lift_candidates": lift_candidate_total,
+            "lift_depth_valid": lift_depth_valid_final,
+            "lift_inliers": lift_inliers,
+            "lift_kept": lift_candidates_kept,
+            "matches": len(matches),
+            "reproj_inliers": reproj_inliers,
+            "reproj_reject": reproj_reject,
+            "tri_candidates": len(tri_candidates),
+            "tri_depth_valid": tri_depth_valid_final,
+            "tri_inliers": tri_inliers,
+            "tri_kept": tri_candidates_kept,
+        }
+        if log_stage is not None:
+            stats["stage"] = log_stage
+        self._write_lifted_debug_log(f"prior_mask_ref{ref_imid}_qry{qry_imid}", stats)
 
         return mask_out
 
@@ -314,13 +585,55 @@ class MpsfmRegistration(BaseClass):
                 matches,
                 kps1,
                 kps2,
+                log_stage="pre_refine",
             )
             # suppress prior inlier summary printing
             # 保存为“当前（imid2）相对参考（imid1）”的内点掩码，供 DC 失败时使用
             self.mpsfm_rec.last_ap_inlier_masks = {imid1: prior_inlier_mask}
             # 采用先验内点作为初始匹配，若过少则退回全部匹配
             ap_min_num_inliers = self.conf.colmap_options.abs_pose_min_num_inliers
-            matches_used = matches[prior_inlier_mask] if prior_inlier_mask.sum() >= max(3, ap_min_num_inliers // 2) else matches
+            prior_inliers = int(prior_inlier_mask.sum())
+            fallback_thresh = max(3, ap_min_num_inliers // 2)
+            use_prior_only = prior_inliers >= fallback_thresh
+            self._write_lifted_debug_log(
+                f"prior_match_select_{imid1}_{imid2}",
+                {
+                    "fallback_threshold": fallback_thresh,
+                    "prior_inliers": prior_inliers,
+                    "total_matches": len(matches),
+                    "use_prior_only": use_prior_only,
+                },
+            )
+            matches_used = matches[prior_inlier_mask] if use_prior_only else matches
+
+            if self.conf.refine_init_prior_pose:
+                refine_matches = matches_used if len(matches_used) > 0 else matches
+                T_c2w_refined, refined_ok, refine_stats = self._refine_init_pair_pose_epipolar(
+                    imid1, imid2, T_c1w, T_c2w, refine_matches, kps1, kps2, camera1, camera2
+                )
+                if refined_ok:
+                    T_c2w = T_c2w_refined
+                    refine_log = {"stage": "init_pair"}
+                    refine_log.update(refine_stats)
+                    self._write_lifted_debug_log(f"prior_pose_refine_{imid1}_{imid2}", refine_log)
+                    refined_mask = self._inlier_mask_for_pair_under_pose(
+                        imid1,
+                        imid2,
+                        T_c1w,
+                        T_c2w,
+                        camera1,
+                        camera2,
+                        matches,
+                        kps1,
+                        kps2,
+                        log_stage="post_refine",
+                    )
+                    self.mpsfm_rec.last_ap_inlier_masks = {imid1: refined_mask}
+                    refined_inliers = int(refined_mask.sum())
+                    if refined_inliers >= fallback_thresh:
+                        matches_used = matches[refined_mask]
+                    else:
+                        matches_used = matches
             
         else:
             # 先尝试 AP（若有 prior1 则在其世界系下，否则 cam1 世界系为单位）
@@ -485,6 +798,7 @@ class MpsfmRegistration(BaseClass):
                     matches_ref_qry,
                     kps_ref,
                     kps_qry,
+                    log_stage="register_next",
                 )
                 inlier_masks_map[ref_id] = mask
 
