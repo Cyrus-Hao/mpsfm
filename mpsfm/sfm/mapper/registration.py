@@ -1,4 +1,5 @@
 from collections import defaultdict
+from pathlib import Path
 
 import numpy as np
 import pycolmap
@@ -161,13 +162,6 @@ class MpsfmRegistration(BaseClass):
             pair_to_indices[(int(pair[0]), int(pair[1]))].append(midx)
 
         image_ref = self.mpsfm_rec.images[ref_imid]
-        projection_center_ref = T_ref_cw.rotation.inverse() * -T_ref_cw.translation
-        projection_center_qry = T_qry_cw.rotation.inverse() * -T_qry_cw.translation
-
-        def _tri_angle_deg(xyz_world):
-            return np.rad2deg(
-                calculate_triangulation_angle(projection_center_ref, projection_center_qry, xyz_world)
-            )
 
         has3d = np.array([image_ref.points2D[int(pid)].has_point3D() for pid in ref_idx], dtype=bool)
         tri_candidates = []
@@ -180,7 +174,7 @@ class MpsfmRegistration(BaseClass):
                         "pt2d_id_1": int(rid),
                         "pt2d_id_2": int(qid),
                         "xyz": np.asarray(xyz, dtype=np.float64),
-                        "tri_angle": _tri_angle_deg(xyz),
+                        "source": "tri",
                     }
                 )
 
@@ -196,7 +190,7 @@ class MpsfmRegistration(BaseClass):
                         "pt2d_id_1": int(rid),
                         "pt2d_id_2": int(qid),
                         "xyz": np.asarray(xyz, dtype=np.float64),
-                        "tri_angle": _tri_angle_deg(xyz),
+                        "source": "lift",
                     }
                 )
 
@@ -204,19 +198,15 @@ class MpsfmRegistration(BaseClass):
             combined = []
             tri_map = {cand["pt2d_id_1"]: cand for cand in tri_list}
             lift_map = {cand["pt2d_id_1"]: cand for cand in lift_list}
-            thresh = self.conf.combined_triangle_thresh
             all_refs = set(tri_map.keys()) | set(lift_map.keys())
             for ref_id in all_refs:
                 tri_c = tri_map.get(ref_id)
                 lift_c = lift_map.get(ref_id)
-                if tri_c and lift_c:
-                    combined.append(tri_c if tri_c["tri_angle"] >= thresh else lift_c)
-                elif tri_c:
-                    if tri_c["tri_angle"] >= thresh:
-                        combined.append(tri_c)
-                elif lift_c:
-                    if lift_c["tri_angle"] < thresh:
-                        combined.append(lift_c)
+                if tri_c:
+                    combined.append(tri_c)
+                    continue
+                if lift_c:
+                    combined.append(lift_c)
             return combined
 
         combined_candidates = _combine_candidates(tri_candidates, lift_candidates)
@@ -225,6 +215,9 @@ class MpsfmRegistration(BaseClass):
 
         xyz_world = np.array([cand["xyz"] for cand in combined_candidates])
         xy_qry_target = np.array([kps_qry[cand["pt2d_id_2"]] for cand in combined_candidates])
+        sources = np.array([cand.get("source", "tri") for cand in combined_candidates])
+        is_tri = sources == "tri"
+        is_lift = sources == "lift"
         xyz_qry_cam = T_qry_cw * xyz_world
         valid_depth = xyz_qry_cam[:, 2] > 0
         reproj_errs = np.full(len(combined_candidates), np.inf, dtype=np.float64)
@@ -232,7 +225,6 @@ class MpsfmRegistration(BaseClass):
             proj_qry = camera_qry.img_from_cam(xyz_qry_cam[valid_depth])
             reproj_errs[valid_depth] = np.linalg.norm(proj_qry - xy_qry_target[valid_depth], axis=1)
         inlier_flags = reproj_errs <= px_thresh
-
         for cand, is_inlier in zip(combined_candidates, inlier_flags):
             if not is_inlier:
                 continue
@@ -472,8 +464,6 @@ class MpsfmRegistration(BaseClass):
             kps_qry = self.mpsfm_rec.keypoints(imid)
             camera_qry = camera
             inlier_masks_map = {}
-            total_matches_cnt = 0
-            total_inliers_cnt = 0
             for ref_id in ref_imids:
                 image_ref = self.mpsfm_rec.images[ref_id]
                 camera_ref = self.mpsfm_rec.rec.cameras[image_ref.camera_id]
@@ -497,8 +487,6 @@ class MpsfmRegistration(BaseClass):
                     kps_qry,
                 )
                 inlier_masks_map[ref_id] = mask
-                total_matches_cnt += len(matches_ref_qry)
-                total_inliers_cnt += int(mask.sum())
 
             # 供 DC 失败时移除“好内点”使用
             self.mpsfm_rec.last_ap_inlier_masks = inlier_masks_map
