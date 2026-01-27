@@ -127,17 +127,10 @@ class MpsfmReconstruction(BaseClass, ColmapReconstructionWrapper, Reconstruction
             Rg = sim3d.rotation.matrix() if hasattr(sim3d, "rotation") else np.eye(3, dtype=float)
         except Exception:
             Rg = np.eye(3, dtype=float)
-        # 组合累计 Sim3：
-        # S_total' = (s, Rg, t) ∘ S_total
-        # s_tot = s * s_tot
-        # R_tot = Rg * R_tot
-        # t_tot = s * (Rg * t_tot) + t
-        try:
-            self.world_sim_translation = scale * (Rg @ self.world_sim_translation) + translation
-            self.world_sim_rotation = Rg @ self.world_sim_rotation
-            self.world_sim_scale *= scale
-        except Exception:
-            pass
+        
+        self.world_sim_translation = scale * (Rg @ self.world_sim_translation) + translation
+        self.world_sim_rotation = Rg @ self.world_sim_rotation
+        self.world_sim_scale *= scale
         # 同步深度尺度到新的世界尺度
         self.normalize_depths(scale)
         return True

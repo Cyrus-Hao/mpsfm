@@ -12,6 +12,7 @@ from mpsfm.sfm.mapper.registration import MpsfmRegistration
 from mpsfm.sfm.mapper.triangulator import MpsfmTriangulator
 from mpsfm.sfm.scene.correspondences import Correspondences
 from mpsfm.sfm.scene.reconstruction import MpsfmReconstruction
+from mpsfm.utils.io import write_match_correspondence_counts
 from mpsfm.utils.tools import log_status
 
 
@@ -112,6 +113,12 @@ class MpsfmMapper(BaseClass):
         self.conf.next_view.verbose = self.conf.verbose
         self.conf.extractors.verbose = self.conf.verbose
 
+        if getattr(self.conf.registration, "use_prior_poses", False) and self.conf.registration.pose_config_path:
+            self.conf.extractors.pose_config_path = self.conf.registration.pose_config_path
+            self.conf.extractors.prior_pose_retrieval = True
+            if self.conf.pairs_type == "retrieval":
+                self.conf.extractors.retrieval = "prior_pose"
+
     def _init(
         self,
         references,
@@ -143,6 +150,7 @@ class MpsfmMapper(BaseClass):
                 self.extractor.extract_retrieval()
             self.extractor.extract_pairs(self.conf.pairs_type)
             self.extractor.extract_pairwise()
+            self._write_sparse_correspondence_counts()
 
             if "depth" in self.conf.matches_mode:
                 self.extractor.extract_normals()
@@ -201,6 +209,23 @@ class MpsfmMapper(BaseClass):
                 pairs_pth=self.extractor.sfm_pairs_path,
             )
             self.mpsfm_rec.init_kps_info(extraction_obj=self.extractor)
+
+    def _write_sparse_correspondence_counts(self):
+        """Write correspondence counts for sparse matcher outputs."""
+        match_path = None
+        if hasattr(self, "extractor"):
+            match_path = self.extractor.match_dirs.get("smatches")
+        if not match_path:
+            return
+        matcher_name = getattr(self.conf.extractors, "matcher", "matcher")
+        safe_name = matcher_name.replace("/", "_")
+        output_path = Path(self.cache_dir) / f"correspondence_counts_{safe_name}.txt"
+        try:
+            wrote = write_match_correspondence_counts(match_path, output_path)
+            if wrote:
+                self.log(f"Saved correspondence counts to {output_path}", level=1)
+        except Exception as exc:
+            self.log(f"Failed to write correspondence counts: {exc}", level=1)
 
     def deregister_image(self, imid):
         """Deregister image from reconstruction"""

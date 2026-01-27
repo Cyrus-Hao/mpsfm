@@ -115,3 +115,63 @@ def get_matches(path: Path, name0: str, name1: str) -> tuple[np.ndarray]:
         matches = np.flip(matches, -1)
     scores = scores[idx]
     return matches, scores
+
+
+def write_match_correspondence_counts(match_path: Path, output_path: Path) -> bool:
+    """Write per-pair correspondence counts from a matches .h5 file."""
+    if match_path is None:
+        return False
+    match_path = Path(match_path)
+    if not match_path.exists():
+        return False
+
+    per_pair = []
+    total_pairs = 0
+    total_correspondences = 0
+    missing_matches0 = 0
+
+    with h5py.File(str(match_path), "r", libver="latest") as hfile:
+        # Two common layouts:
+        # 1) /pair_name/{matches0, matching_scores0}
+        # 2) /name0/name1/{matches0, matching_scores0}
+        has_flat = any(
+            isinstance(hfile[key], h5py.Group) and "matches0" in hfile[key] for key in hfile.keys()
+        )
+        if has_flat:
+            for pair in hfile:
+                grp = hfile[pair]
+                if "matches0" not in grp:
+                    missing_matches0 += 1
+                    continue
+                matches0 = grp["matches0"][()]
+                count = int(np.count_nonzero(matches0 != -1))
+                per_pair.append((pair, count))
+                total_pairs += 1
+                total_correspondences += count
+        else:
+            for name0 in hfile:
+                grp0 = hfile[name0]
+                for name1 in grp0:
+                    grp1 = grp0[name1]
+                    if not isinstance(grp1, h5py.Group) or "matches0" not in grp1:
+                        missing_matches0 += 1
+                        continue
+                    matches0 = grp1["matches0"][()]
+                    count = int(np.count_nonzero(matches0 != -1))
+                    pair = f"{name0}/{name1}"
+                    per_pair.append((pair, count))
+                    total_pairs += 1
+                    total_correspondences += count
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(f"matches_path: {match_path}\n")
+        f.write(f"total_pairs: {total_pairs}\n")
+        f.write(f"total_correspondences: {total_correspondences}\n")
+        if missing_matches0:
+            f.write(f"pairs_missing_matches0: {missing_matches0}\n")
+        f.write("pair correspondence_count\n")
+        for pair, count in sorted(per_pair, key=lambda x: x[0]):
+            f.write(f"{pair} {count}\n")
+    return True

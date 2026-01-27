@@ -142,6 +142,59 @@ class MpsfmRegistration(BaseClass):
             return t
         return t / norm
 
+    @staticmethod
+    def _camera_center_from_pose(pose: pycolmap.Rigid3d) -> np.ndarray:
+        R = pose.rotation.matrix()
+        t = np.asarray(pose.translation, dtype=np.float64)
+        return -R.T @ t
+
+    @staticmethod
+    def _estimate_sim3(src_pts: np.ndarray, dst_pts: np.ndarray):
+        if src_pts.shape[0] < 3 or dst_pts.shape[0] < 3:
+            return None
+        src_mean = src_pts.mean(axis=0)
+        dst_mean = dst_pts.mean(axis=0)
+        src_centered = src_pts - src_mean
+        dst_centered = dst_pts - dst_mean
+        cov = (dst_centered.T @ src_centered) / float(src_pts.shape[0])
+        U, S, Vt = np.linalg.svd(cov)
+        R = U @ Vt
+        if np.linalg.det(R) < 0:
+            U[:, -1] *= -1
+            R = U @ Vt
+        var_src = np.mean(np.sum(src_centered**2, axis=1))
+        if var_src < 1e-12:
+            return None
+        scale = float(np.sum(S) / var_src)
+        t = dst_mean - scale * (R @ src_mean)
+        return scale, R, t
+
+    def _update_world_sim_from_priors(self, min_shared: int = 3) -> bool:
+        if not self.prior_poses:
+            return False
+        src_centers = [] # src_centers：先验世界坐标系中的相机中心
+        dst_centers = [] # dst_centers：当前世界坐标系中的相机中心
+        for imid, image in self.mpsfm_rec.registered_images.items():
+            prior_pose = self.get_prior_pose(image.name)
+            if prior_pose is None:
+                continue
+            if not image.has_pose:
+                continue
+            src_centers.append(self._camera_center_from_pose(prior_pose))
+            dst_centers.append(self._camera_center_from_pose(image.cam_from_world))
+        if len(src_centers) < min_shared:
+            return False
+        src_pts = np.stack(src_centers, axis=0) 
+        dst_pts = np.stack(dst_centers, axis=0) 
+        sim3 = self._estimate_sim3(src_pts, dst_pts)
+        if sim3 is None:
+            return False
+        scale, R, t = sim3
+        self.mpsfm_rec.world_sim_scale = scale
+        self.mpsfm_rec.world_sim_rotation = R
+        self.mpsfm_rec.world_sim_translation = t
+        return True
+
     def _normalized_keypoints(self, camera, keypoints):
         if len(keypoints) == 0:
             return np.zeros((0, 3), dtype=np.float64)
@@ -767,6 +820,7 @@ class MpsfmRegistration(BaseClass):
         image_name = image.name
         prior_pose = self.get_prior_pose(image_name)
         if prior_pose is not None:
+            self._update_world_sim_from_priors()
             image.cam_from_world = self.mpsfm_rec.align_prior_pose_to_current_world(prior_pose)
 
             # 在使用先验直接注册前，生成与所有参考图像的 inlier masks

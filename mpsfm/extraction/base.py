@@ -10,7 +10,7 @@ from mpsfm.vars import gvars
 from .imagewise import features as extract_features
 from .imagewise import geometry as extract_mono
 from .imagewise import mask as extract_skyseg
-from .pairs import pairs_from_exhaustive, pairs_from_retrieval, pairs_from_sequential
+from .pairs import pairs_from_exhaustive, pairs_from_prior_pose, pairs_from_retrieval, pairs_from_sequential
 from .pairwise import CONFIG_DIR as PAIRWISE_CONFIG_DIR
 from .pairwise import match_dense_2view
 from .pairwise import match_sparse as match_features
@@ -43,6 +43,9 @@ class Extraction(BaseClass):
         # pairs
         "retrieval": "netvlad",
         "nquery": 20,  # retrieval
+        "prior_pose_retrieval": False,
+        "pose_config_path": None,
+        "prior_pose_candidate_multiplier": 3.0,
         "noverlap": 2,  # sequential
         "quadratic_overlap": False,  # sequential
         "dataset": {
@@ -87,6 +90,10 @@ class Extraction(BaseClass):
         if extract is None:
             extract = set()
         self.extract = extract
+
+    def _use_prior_pose_retrieval(self) -> bool:
+        flag = bool(getattr(self.conf, "prior_pose_retrieval", False) or self.conf.retrieval == "prior_pose")
+        return bool(flag and self.conf.pose_config_path)
 
     def extract_and_match_sparse(self, overwrite=False):
         """Extract and match sparse features."""
@@ -239,6 +246,9 @@ class Extraction(BaseClass):
 
     def extract_retrieval(self, overwrite=False):
         """Extract retrieval features."""
+        if self._use_prior_pose_retrieval():
+            self.log("Skipping NetVLAD retrieval features (using prior poses).", level=1)
+            return None
         retrieval_conf = load_cfg(extract_features.CONFIG_DIR / f"{self.conf.retrieval}.yaml")
         print(f"Extracting {self.conf.retrieval} retrieval features...")
         if any(s in self.extract for s in ["r", "retrieval"]):
@@ -283,14 +293,27 @@ class Extraction(BaseClass):
                 quadratic_overlap=self.conf.quadratic_overlap,
             )
         elif pairs_type == "retrieval":
-            self.sfm_pairs_path = Path(base, f"pairs_{self.conf.retrieval}-{self.conf.nquery}.txt")
-            pairs_from_retrieval(
-                self.retrieval_path,
-                self.sfm_pairs_path,
-                self.conf.nquery,
-                query_list=self.images_list,
-                db_list=self.images_list,
-            )
+            if self._use_prior_pose_retrieval():
+                self.sfm_pairs_path = Path(base, f"pairs_prior_pose-{self.conf.nquery}.txt")
+                pairs_from_prior_pose(
+                    output=self.sfm_pairs_path,
+                    num_matched=self.conf.nquery,
+                    pose_config_path=self.conf.pose_config_path,
+                    image_list=self.images_list,
+                    query_list=self.images_list,
+                    db_list=self.images_list,
+                    candidate_multiplier=self.conf.prior_pose_candidate_multiplier,
+                    verbose=self.conf.verbose,
+                )
+            else:
+                self.sfm_pairs_path = Path(base, f"pairs_{self.conf.retrieval}-{self.conf.nquery}.txt")
+                pairs_from_retrieval(
+                    self.retrieval_path,
+                    self.sfm_pairs_path,
+                    self.conf.nquery,
+                    query_list=self.images_list,
+                    db_list=self.images_list,
+                )
 
     def extract_sky_mask(self, overwrite=False):
         """Extract sky masks."""
