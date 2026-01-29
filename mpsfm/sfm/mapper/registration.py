@@ -771,19 +771,41 @@ class MpsfmRegistration(BaseClass):
             T_c1w, T_c2w, matches_used, self.mpsfm_rec.images[imid1], self.mpsfm_rec.images[imid2], camera1, camera2
         )
 
-        # 合并
+        # 合并（按 (pt2d_id_1, pt2d_id_2) 对齐，避免重复匹配错配）
         cand = {}
-        ids1, ids2 = pts_lift["pt2d_id_1"], pts_tri["pt2d_id_1"]
-        set1, set2 = set(ids1), set(ids2)
-        idx1 = [i for i, x in enumerate(ids1) if x not in set2]
-        idx2 = [i for i, x in enumerate(ids2) if x not in set1]
-        common = list(set1 & set2)
-        lift_com = {k: [v for v, i in zip(vals, ids1) if i in common] for k, vals in pts_lift.items()}
-        tri_com = {k: [v for v, i in zip(vals, ids2) if i in common] for k, vals in pts_tri.items()}
-        for k in pts_lift:
-            cand[k] = [a if t < self.conf.combined_triangle_thresh else b for (a, b, t) in zip(lift_com[k], tri_com[k], pts_tri["tri_angle"])]
-            cand[k] += [pts_lift[k][i] for i in idx1 if pts_lift["tri_angle"][i] < self.conf.combined_triangle_thresh]
-            cand[k] += [pts_tri[k][i] for i in idx2 if pts_tri["tri_angle"][i] >= self.conf.combined_triangle_thresh]
+        ids1 = pts_lift.get("pt2d_id_1", [])
+        ids1_b = pts_lift.get("pt2d_id_2", [])
+        ids2 = pts_tri.get("pt2d_id_1", [])
+        ids2_b = pts_tri.get("pt2d_id_2", [])
+
+        keys = pts_lift.keys() if len(pts_lift) else pts_tri.keys()
+        for k in keys:
+            cand[k] = []
+
+        tri_map = defaultdict(list)
+        for i, pair in enumerate(zip(ids2, ids2_b)):
+            tri_map[pair].append(i)
+
+        # 先处理 lift 中的元素：如 tri 中有同 pair，则选择 lift/tri；否则走 lift-only
+        for i, pair in enumerate(zip(ids1, ids1_b)):
+            if pair in tri_map and tri_map[pair]:
+                i_tri = tri_map[pair].pop(0)
+                use_lift = pts_tri["tri_angle"][i_tri] < self.conf.combined_triangle_thresh
+                src = pts_lift if use_lift else pts_tri
+                idx = i if use_lift else i_tri
+                for k in keys:
+                    cand[k].append(src[k][idx])
+            else:
+                if pts_lift["tri_angle"][i] < self.conf.combined_triangle_thresh:
+                    for k in keys:
+                        cand[k].append(pts_lift[k][i])
+
+        # tri-only（剩余未匹配的 pair）
+        for tri_indices in tri_map.values():
+            for i_tri in tri_indices:
+                if pts_tri["tri_angle"][i_tri] >= self.conf.combined_triangle_thresh:
+                    for k in keys:
+                        cand[k].append(pts_tri[k][i_tri])
 
         # 赋姿并注册
         self.mpsfm_rec.images[imid1].cam_from_world = T_c1w
@@ -791,7 +813,7 @@ class MpsfmRegistration(BaseClass):
         
         self.mpsfm_rec.register_image(imid1)
         self.mpsfm_rec.register_image(imid2)
-        if len(cand["xyz"]) < 3:
+        if len(cand.get("xyz", [])) < 3:
             print(f"Init pair {imid1} and {imid2} has less than 3 points to triangulate. Not registered")
             return False
         for i, xyz in enumerate(cand["xyz"]):
@@ -1036,34 +1058,41 @@ class MpsfmRegistration(BaseClass):
 
         # combining lifted and triangulated points
         candidate_points = {}
-        ids1, ids2 = points_lifted["pt2d_id_1"], points_triangulated["pt2d_id_1"]
-        setids1, setids2 = set(ids1), set(ids2)
-        indices1 = [i for i, x in enumerate(ids1) if x not in setids2]
-        indices2 = [i for i, x in enumerate(ids2) if x not in setids1]
-        common_elements = list(setids1 & setids2)
-        common_points_lifted = {
-            k: [v for v, id in zip(values, ids1) if id in common_elements] for k, values in points_lifted.items()
-        }
-        common_points_triangulated = {
-            k: [v for v, id in zip(values, ids2) if id in common_elements] for k, values in points_triangulated.items()
-        }
-        for k in points_lifted:
-            candidate_points[k] = [
-                a if tri_angle < self.conf.combined_triangle_thresh else b
-                for (a, b, tri_angle) in zip(
-                    common_points_lifted[k], common_points_triangulated[k], common_points_triangulated["tri_angle"]
-                )
-            ]
-            candidate_points[k] += [
-                points_lifted[k][i]
-                for i in indices1
-                if points_lifted["tri_angle"][i] < self.conf.combined_triangle_thresh
-            ]
-            candidate_points[k] += [
-                points_triangulated[k][i]
-                for i in indices2
-                if points_triangulated["tri_angle"][i] >= self.conf.combined_triangle_thresh
-            ]
+        ids1 = points_lifted.get("pt2d_id_1", [])
+        ids1_b = points_lifted.get("pt2d_id_2", [])
+        ids2 = points_triangulated.get("pt2d_id_1", [])
+        ids2_b = points_triangulated.get("pt2d_id_2", [])
+
+        keys = points_lifted.keys() if len(points_lifted) else points_triangulated.keys()
+        if not keys:
+            keys = ["pt2d_id_1", "pt2d_id_2", "tri_angle", "posdepth1", "posdepth2", "xyz"]
+        for k in keys:
+            candidate_points[k] = []
+
+        tri_map = defaultdict(list)
+        for i, pair in enumerate(zip(ids2, ids2_b)):
+            tri_map[pair].append(i)
+
+        # 先处理 lift 中的元素：如 tri 中有同 pair，则选择 lift/tri；否则走 lift-only
+        for i, pair in enumerate(zip(ids1, ids1_b)):
+            if pair in tri_map and tri_map[pair]:
+                i_tri = tri_map[pair].pop(0)
+                use_lift = points_triangulated["tri_angle"][i_tri] < self.conf.combined_triangle_thresh
+                src = points_lifted if use_lift else points_triangulated
+                idx = i if use_lift else i_tri
+                for k in keys:
+                    candidate_points[k].append(src[k][idx])
+            else:
+                if points_lifted["tri_angle"][i] < self.conf.combined_triangle_thresh:
+                    for k in keys:
+                        candidate_points[k].append(points_lifted[k][i])
+
+        # tri-only（剩余未匹配的 pair）
+        for tri_indices in tri_map.values():
+            for i_tri in tri_indices:
+                if points_triangulated["tri_angle"][i_tri] >= self.conf.combined_triangle_thresh:
+                    for k in keys:
+                        candidate_points[k].append(points_triangulated[k][i_tri])
         return candidate_points, cam_from_world2
 
     def _collect_pairs(
